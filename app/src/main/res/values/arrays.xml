@@ -1,0 +1,10 @@
+<resources>
+    <string-array name="xposed_scope">
+        <item>android</item>
+        <item>com.android.wifi</item>
+        <item>com.android.server.wifi</item>
+        <item>com.google.android.networkstack</item>
+        <item>com.android.networkstack</item>
+        <item>foxlost.miracast.sink</item>
+    </string-array>
+</resources>

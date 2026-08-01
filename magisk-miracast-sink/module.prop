@@ -1,0 +1,6 @@
+id=miracast-sink-system
+name=Miracast Sink (System Priv-App)
+version=v1.3
+versionCode=4
+author=foxlost
+description=Installs Universal Miracast Sink as a system privileged app, granting CONFIGURE_WIFI_DISPLAY permission
