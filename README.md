@@ -4,6 +4,12 @@ A system-level Miracast (Wi-Fi Display) receiver for Android 10+, deployed as a 
 
 **Current version**: v1.3 (versionCode 4)
 
+## Little story about this project:
+I have Xiaomi Pad 6 that has Miracast Sink mode built in to devices (com.xiaomi.miralink) that works on newer android 14 (HyperOS 2) and i want to implement that so my Second devices can become like viewfinder when using camera and another,
+so i try to get many data like decompile apk from xiaomi miralink, decompile firmware from my android box (x96 mini) that has firmware android 7 and android 9 build that support Miracast Sink, and capture the wifi direct communication with
+my usb wifi that support monitoring mode, after that i spend roughly 1 week vibe coding the app with all the data that i can find, try using root methode send command to android hidden api, using xposed to hook system_server, and
+try using magisk module to put the apk on system so the app can get android hidden api directly, and that finally the app working and my device can be datacted as miracast sink display, so here the project i publish
+
 ## Screenshots
 
 | Dashboard | Streaming |
