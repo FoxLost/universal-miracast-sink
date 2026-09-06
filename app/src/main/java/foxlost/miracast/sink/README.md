@@ -1,90 +1,85 @@
 # Core Package (`foxlost.miracast.sink`)
 
-The main application package containing the service, activities, and WFD handshake logic.
+The application package contains the dashboard, foreground service, adaptive session controller, and fullscreen player.
 
 ## Files
 
-### `MainActivity.kt` — Dashboard UI
+### `MainActivity.kt` — Dashboard and diagnostics
 
-Jetpack Compose-based dashboard showing:
-- Sink device name (read from wpa_supplicant via `dumpsys wifi`)
-- Service status ("Inactive" vs "Ready to accept")
-- Connect-to guide text
-- START/STOP Miracast Sink button (toggles foreground service)
-- Footer credit: "Made with Free Time and Free Will by FoxLost"
+Jetpack Compose dashboard for starting/stopping the sink, editing persisted settings, and viewing a compact live diagnostic panel. Runtime permissions are requested for location and, on Android 13+, nearby Wi-Fi devices.
 
-### `MiracastService.kt` — Foreground Service
+The **Activity** panel retains the newest 12 in-memory events and renders at most four rows. Rows show only `category / message`; timestamps are intentionally not displayed. Starting a new sink session clears the previous tail. This is diagnostic telemetry, not durable logging or an event bus.
 
-The central orchestrator. Runs as a foreground service with a persistent notification.
+### `MiracastService.kt` — Foreground service
 
-**Responsibilities**:
-- **Startup**: Calls `startForeground()` unconditionally at top of `onStartCommand` (satisfies Android 14+ FGS contract for all action types — START, STOP, and DISCONNECT), creates notification channel, starts RTSP server on port 7236, runs root setup script (hidden API bypass, iptables flush), initializes P2P discovery
-- **P2P lifecycle**: Receives `onP2pGroupConnected` with group info, finds source IP from ARP table (`/proc/net/arp`), opens iptables rules for p2p0
-- **WFD handshake** (`startRtspHandshake`): Connects TCP to source:7236, drives M1-M7 RTSP negotiation, starts PlayerActivity after SETUP 200 OK, sends PLAY with parsed Session ID
-- **Streaming**: Keeps RTSP socket alive (`soTimeout=0`), handles GET_PARAMETER keepalive, TEARDOWN trigger
-- **Cleanup**: Uses `stopping` flag to make `stopSinkAndCleanup()` idempotent (prevents duplicate teardown on double-delivered DISCONNECT actions), releases wake lock, stops P2P, sends `SESSION_END` broadcast to finish PlayerActivity
-- **Notification**: Updates with "Connected to: [device name]" + Disconnect button during streaming
-- **Wake lock**: `SCREEN_BRIGHT_WAKE_LOCK` to keep screen on
+The service owns the session generation, RTSP server, P2P manager, media hand-off, notification, and cleanup. It calls `startForeground()` for every command path, starts the configured RTSP listener (default TCP 7236), and starts P2P work only for the current generation. A wake lock is held while the sink is active.
 
-**Constants exposed**:
-| Constant | Value | Purpose |
-|---|---|---|
-| `ACTION_START` | "ACTION_START" | Start Miracast sink service |
-| `ACTION_STOP` | "ACTION_STOP" | Stop Miracast sink service |
-| `ACTION_DISCONNECT` | "ACTION_DISCONNECT" | Disconnect from notification button |
-| `CHANNEL_ID` | "MiracastSinkChannel" | Notification channel |
-| `isActive` | Boolean | Static flag for service state (read by dashboard) |
+On a ready P2P group, the service resolves the source address from the peer MAC and ARP/procfs tables, applies the p2p0 firewall rules, and connects to the source's advertised RTSP control port. Pre-RTSP connect failures are reported to P2P so the bounded attempt policy can retry. RTP receiver binding is awaited for up to 5 seconds before SETUP continues.
 
-**Key flow**: `onStartCommand` → start RTSP → root setup → P2P start → `onP2pGroupConnected` → restart RTSP → ARP lookup → `startRtspHandshake` → M1-M7 → PLAY → streaming → TEARDOWN → cleanup
+Cleanup invalidates the session generation before closing RTSP/media resources, broadcasts `foxlost.miracast.SESSION_END` to finish `PlayerActivity`, releases the wake lock, stops P2P, and stops the service. The `stopping` guard makes cleanup idempotent and prevents late callbacks from reopening media.
 
-### `PlayerActivity.kt` — Video Playback Surface
+### `AdaptiveSession.kt` — Generation/state controller
 
-Displays the decoded Miracast video stream in immersive fullscreen.
+Each start creates a monotonically increasing generation. The controller accepts only callbacks belonging to the current generation and attempt, and ignores stale callbacks after reset/stop.
 
-**Features**:
-- Uses `TextureView` with `SurfaceTextureListener` for proper view hierarchy integration
-- **Immersive fullscreen**: Hides both status bar and gesture navigation bar via `WindowInsetsController` (API 30+) or `SYSTEM_UI_FLAG_IMMERSIVE_STICKY` (older APIs); reapplied in `onResume`
-- **Edge-to-edge rendering**: Theme uses translucent navigation/status bars so video draws behind system bars when they transiently appear on swipe
-- Resizes viewport dynamically: `maxOf` (crop to fill) in portrait, `minOf` (fit) in landscape
-- `onConfigurationChanged` detects rotation and adjusts view size
-- Receives `SESSION_END` broadcast to auto-finish on disconnect
-- Video dimensions detected from MediaCodec output format and applied to `SurfaceTexture.setDefaultBufferSize()`
+States are:
 
-## WFD Handshake Details
+`Idle → P2pStarting → Discovering → GroupForming → GroupFormed → ControlConnecting/ControlAccepted → Negotiating → TransportReady → MediaStarting → Streaming → Stopping`.
 
-The handshake (`startRtspHandshake` in MiracastService) is a carefully ordered RTSP exchange matching real Android Wi-Fi Display behavior:
+The source owns the RTSP server in both P2P role arrangements, so the sink uses an outbound RTSP connection. Profiles are selected from observed source evidence (Windows, Android, or unknown) and control timing/capability details such as the optional second PLAY.
 
-1. **TCP connect** to source:7236 (sink acts as RTSP client)
-2. **Wait** for source's M1 OPTIONS (source initiates)
-3. **Respond** 200 OK with `Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER`
-4. **Send** sink's OPTIONS (M2) with `Require: org.wfa.wfd1.0`
-5. **Respond** to M3 GET_PARAMETER with sink capabilities
-6. **Respond** to M5a SET_PARAMETER (source caps + presentation URL)
-7. **Respond** to M5b SET_PARAMETER (trigger_method: SETUP)
-8. **Send** SETUP with `Transport: RTP/AVP/UDP;unicast;client_port=15550-15551`
-9. **Parse** Session from SETUP response
-10. **Start** PlayerActivity (RTP receiver prepares)
-11. **Send** PLAY with parsed Session
-12. **Set** `soTimeout=0` (infinite, keep socket alive)
-13. **Handle** TEARDOWN trigger → break loop → broadcast `SESSION_END`
+### `PlayerActivity.kt` — Fullscreen media surface
 
-## Capabilities Advertised
+Receives the negotiated RTP/RTCP ports and session generation, prepares a `TextureView`, decodes H.264 with the media pipeline, and plays LPCM audio when enabled. It applies immersive fullscreen behavior and finishes when the service broadcasts `SESSION_END`.
 
-```
-wfd_video_formats: 00 00 01 10 0001bde1 00300000 000003c0
-wfd_audio_codecs: LPCM 00000002 00
-wfd_client_rtp_ports: RTP/AVP/UDP;unicast 15550 0 mode=play
-wfd_uibc_capability: none
+## Session lifecycle and retry behavior
+
+`P2pManager` serializes framework LISTEN, extended LISTEN, discovery, and the optional supplicant monitor. It prefers framework `startListening()` and falls back to peer discovery if reflection or the asynchronous action fails. A group-started indication is only a candidate: readiness polling refreshes group info followed by connection info and waits for a formed group, peer, UP P2P interface, and non-loopback IPv4 address.
+
+Readiness is polled every 250 ms for up to 6 seconds. Failed formation, readiness timeout, group loss, invitation fallback/stall, and pre-RTSP control-connect failures invalidate the attempt, wait up to 2 seconds for group cleanup, then retry after 500 ms. There are at most three attempts per session generation. When all attempts fail, the service reports exhaustion and finishes the session. Delayed callbacks from prior generations/attempts are ignored.
+
+## Telemetry categories
+
+`DebugEventLog` is thread-safe and process-local. It retains a maximum of 12 events, evicts oldest entries, clears deduplication/rate-limit state on session start, and does not persist or export data.
+
+| Category | Typical events |
+|---|---|
+| `SINK` | service/session start and stop |
+| `P2P` | discovery, group candidates, group formation/loss, attempt reset |
+| `WFD` | framework or supplicant WFD setup, profile selection, parameters |
+| `DHCP` | source address resolution and interface readiness |
+| `RTSP` | connection, requests/responses, negotiation, transport, teardown |
+| `RTP` | receiver bind, first packet, packet counters, stop |
+| `MEDIA` | decoder/audio start, SPS changes, first decoded frame |
+| `ERROR` | bind, readiness, address, protocol, and decoder failures |
+
+One-shot events are deduplicated per key. Noisy events use a 5-second default rate limit (or an explicit interval), so packet/error paths remain bounded.
+
+## WFD and RTSP handshake
+
+The sink advertises the runtime-generated WFD payload `00111C440032` (device information, session availability, and 50 Mbps maximum throughput), using the framework API or the root supplicant fallback. The configured RTSP control port is advertised rather than a fixed vendor payload.
+
+The source initiates the reverse-RTSP exchange. The sink responds to M1 OPTIONS, sends its M2 OPTIONS, answers capability GET/SET_PARAMETER requests, sends SETUP with its local RTP ports, waits for media receiver readiness, parses the returned Session, and sends PLAY (including the configured Android-compatible second PLAY). TEARDOWN or group loss closes the session.
+
+## Build, sign, and package
+
+Requirements: Android SDK/build-tools 34.0.0, Gradle wrapper, and an AOSP platform key pair. `scripts/build.sh` expects `../platform_build-main/target/product/security/platform.pk8` and `platform.x509.pem` by default; set `PLATFORM_KEY_DIR` to override. It builds release, signs with the platform key, verifies the signature, and emits `app/build/outputs/apk/release/MiracastSink-v<VERSION>.apk` plus `MiracastSink.apk`.
+
+```bash
+./scripts/build.sh
+./scripts/pack-magisk.sh
+# output: magisk-miracast-sink-v<VERSION>-platform.zip
 ```
 
-- Resolutions: up to 1080p60 (CEP profile 3.1)
-- Audio: LPCM 48kHz 2ch 16-bit
-- RTP: Video on port 15550, Audio on port 15551
+The packer extracts package/version metadata from the signed APK, updates `magisk-miracast-sink/module.prop`, copies the APK into `system/priv-app/MiracastSink/`, and creates the flashable zip. Install it from Magisk Manager or with:
 
-## Notification States
+```bash
+adb push magisk-miracast-sink-v1.4-platform.zip /sdcard/
+adb shell su -c 'magisk --install-module /sdcard/magisk-miracast-sink-v1.4-platform.zip'
+```
 
-| State | Text | Disconnect Button | Tap Target |
-|---|---|---|---|
-| Idle | "Miracast Sink is active" | No | MainActivity |
-| Connected | "Connected to: [Device]" | Yes | MainActivity |
-| Streaming | "Streaming from: [Device]" | Yes | PlayerActivity |
+`customize.sh` rejects a module without the signed APK and clears stale PackageManager, ART, and launcher icon caches during installation. Reboot after installing. Do not deploy this documentation workflow directly to a device without root/Magisk and platform-compatible signing.
+
+## Verification notes
+
+The repository contains JVM tests for the adaptive session controller, retry/readiness predicates, telemetry bounds, service launch/cleanup helpers, protocol parsing, RTP, and MPEG-TS behavior. Run the targeted tests and a release build in an environment with the Android SDK and platform keys. Device-level Miracast interoperability remains hardware/vendor dependent; this package has no emulator substitute for Wi-Fi P2P, supplicant, firewall, RTSP, and decoder behavior. Diagnostic captures are read-only helpers and do not themselves start a connection.
