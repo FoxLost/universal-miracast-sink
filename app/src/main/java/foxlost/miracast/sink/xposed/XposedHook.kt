@@ -13,14 +13,111 @@ class XposedHook : IXposedHookLoadPackage {
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         val pkg = lpparam.packageName
-        if (pkg != "android" && !pkg.contains("wifi") && pkg != "com.google.android.networkstack") return
+        // Use XposedBridge.log() so messages go to the Vector/LSPosed log file,
+        // not just logcat (which may not capture system_server boot-time logs).
+        XposedBridge.log("[$TAG] handleLoadPackage called for pkg=$pkg classLoader=${lpparam.classLoader}")
+        if (pkg != "android" && !pkg.contains("wifi") && pkg != "com.google.android.networkstack") {
+            XposedBridge.log("[$TAG] Skipping pkg=$pkg (not in scope)")
+            return
+        }
+        XposedBridge.log("[$TAG] LSPosed module loaded for $pkg — setting up hooks")
         Log.i(TAG, "LSPosed module loaded for $pkg")
 
         try {
             bypassConfigureWfdPermission(lpparam)
-            injectWfdInfoOnSet(lpparam)
+            hookExtListen(lpparam)
+            XposedBridge.log("[$TAG] All hooks set up successfully for $pkg")
         } catch (e: Exception) {
+            XposedBridge.log("[$TAG] Hook setup failed in $pkg: ${e.message}")
             Log.e(TAG, "Hook setup failed in $pkg: ${e.message}")
+        }
+    }
+
+    /**
+     * Hook Extended Listen Timing so the supplicant re-enters LISTEN quickly
+     * after Provision Discovery, before Windows sends the GO Negotiation Request.
+     *
+     * Root cause: the framework calls p2pExtListen(true, 500, 500) when
+     * startListening() is invoked — a 500 ms interval. After PD completes,
+     * wpa_supplicant's internal P2P state machine drops to IDLE. The next
+     * extended-listen window fires up to 500 ms later. Windows sends its GO
+     * Negotiation Request ~28 ms after PD — inside that IDLE gap — and the
+     * supplicant rejects it with Status 1 ("not ready"), deadlocking the
+     * exchange.
+     *
+     * Fix: force a 10/10 ms extended-listen interval (period=interval=10) so
+     * the supplicant re-enters LISTEN within 10 ms of PD completion — well
+     * before the GO-neg arrives. With Wi-Fi STA disconnected (no channel
+     * conflict), the single radio stays on the P2P listen channel full-time,
+     * so the 10 ms windows are never skipped due to concurrency.
+     *
+     * When the framework calls p2pExtListen(false, 0, 0) to DISABLE extended
+     * listen (on stopListening), we let it through unchanged.
+     */
+    private fun hookExtListen(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val extPeriod = 10   // ms — short enough to re-enter LISTEN before GO-neg
+        val extInterval = 10 // ms — period == interval → 100% duty cycle
+
+        // Hook WifiP2pNative.p2pExtListen(boolean, int, int)
+        try {
+            val wifiNative = XposedHelpers.findClassIfExists(
+                "com.android.server.wifi.p2p.WifiP2pNative", lpparam.classLoader
+            )
+            XposedBridge.log("[$TAG] WifiP2pNative class: $wifiNative")
+            if (wifiNative != null) {
+                XposedHelpers.findAndHookMethod(wifiNative, "p2pExtListen",
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val enable = param.args[0] as Boolean
+                            if (enable) {
+                                param.args[1] = extPeriod
+                                param.args[2] = extInterval
+                                XposedBridge.log("[$TAG] Forced p2pExtListen(true, $extPeriod, $extInterval)")
+                            }
+                        }
+                    })
+                XposedBridge.log("[$TAG] Hooked WifiP2pNative.p2pExtListen")
+                Log.i(TAG, "Hooked WifiP2pNative.p2pExtListen")
+            } else {
+                XposedBridge.log("[$TAG] WifiP2pNative NOT FOUND in classLoader")
+            }
+        } catch (e: Exception) {
+            XposedBridge.log("[$TAG] p2pExtListen hook failed: ${e.message}")
+            Log.e(TAG, "p2pExtListen hook: ${e.message}")
+        }
+
+        // Hook SupplicantP2pIfaceHal.configureExtListen(boolean, int, int) as backup
+        try {
+            val supplicantCls = XposedHelpers.findClassIfExists(
+                "com.android.server.wifi.p2p.SupplicantP2pIfaceHal", lpparam.classLoader
+            )
+            XposedBridge.log("[$TAG] SupplicantP2pIfaceHal class: $supplicantCls")
+            if (supplicantCls != null) {
+                XposedHelpers.findAndHookMethod(supplicantCls, "configureExtListen",
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val enable = param.args[0] as Boolean
+                            if (enable) {
+                                param.args[1] = extPeriod
+                                param.args[2] = extInterval
+                                XposedBridge.log("[$TAG] Forced configureExtListen(true, $extPeriod, $extInterval)")
+                            }
+                        }
+                    })
+                XposedBridge.log("[$TAG] Hooked SupplicantP2pIfaceHal.configureExtListen")
+                Log.i(TAG, "Hooked SupplicantP2pIfaceHal.configureExtListen")
+            } else {
+                XposedBridge.log("[$TAG] SupplicantP2pIfaceHal NOT FOUND in classLoader")
+            }
+        } catch (e: Exception) {
+            XposedBridge.log("[$TAG] configureExtListen hook failed: ${e.message}")
+            Log.e(TAG, "configureExtListen hook: ${e.message}")
         }
     }
 
@@ -43,71 +140,4 @@ class XposedHook : IXposedHookLoadPackage {
         }
     }
 
-    private fun injectWfdInfoOnSet(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
-            var supplicantCls = XposedHelpers.findClassIfExists(
-                "com.android.server.wifi.p2p.SupplicantP2pIfaceHal",
-                lpparam.classLoader
-            )
-            if (supplicantCls == null) {
-                supplicantCls = XposedHelpers.findClassIfExists(
-                    "android.hardware.wifi.supplicant.V1_4.ISupplicantP2pIface",
-                    lpparam.classLoader
-                )
-            }
-            if (supplicantCls != null) {
-                var hooked = false
-                for (method in supplicantCls.declaredMethods) {
-                    if (method.name == "setWfdDeviceInfo" && method.parameterTypes.size == 1) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                param.args[0] = "0151001C4432" 
-                                Log.d(TAG, "Injected WFD device info hex into supplicant")
-                            }
-                        })
-                        hooked = true
-                    }
-                    if (method.name == "enableWfd" && method.parameterTypes.size == 1) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                param.args[0] = true
-                                Log.d(TAG, "Forced enableWfd(true)")
-                            }
-                        })
-                    }
-                }
-                Log.i(TAG, "Supplicant level WFD info injection: $hooked")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Supplicant WFD hook: ${e.message}")
-        }
-
-        try {
-            val wifiNative = XposedHelpers.findClassIfExists(
-                "com.android.server.wifi.p2p.WifiP2pNative", lpparam.classLoader
-            )
-            if (wifiNative != null) {
-                for (method in wifiNative.declaredMethods) {
-                    if (method.name == "enableWfd" && method.parameterTypes.size == 1) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                param.args[0] = true
-                                Log.d(TAG, "Forced WifiP2pNative.enableWfd(true)")
-                            }
-                        })
-                    }
-                    if (method.name == "setWfdDeviceInfo" && method.parameterTypes.size == 1) {
-                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                param.args[0] = "0151001C4432"
-                                Log.d(TAG, "Injected WFD info via WifiP2pNative")
-                            }
-                        })
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "WifiP2pNative hook: ${e.message}")
-        }
-    }
 }

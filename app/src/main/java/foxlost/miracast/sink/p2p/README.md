@@ -10,33 +10,41 @@ Manages the Wi-Fi Direct sink lifecycle: starting discovery, injecting WFD capab
 
 **Key flows**:
 
-1. **startSink()**: Disables framework `WifiDisplayController` (`wifi_display_on=0`), calls `chainWfdInfo()` to set WFD capabilities
+1. **startSink(generation)**: Disables framework `WifiDisplayController` (`wifi_display_on=0`), assigns a generation-scoped P2P attempt token, and calls `chainWfdInfo()` to set WFD capabilities.
 2. **chainWfdInfo()**: Tries two methods to set WFD info:
    - **Method A**: Reflection-based `setWfdInfo()` on `WifiP2pManager` (works with platform-signed system app)
    - **Method B**: Root fallback — `app_process` execution of `SupplicantWriter` to inject `WFD_SUBELEM_SET` directly into wpa_supplicant
 3. **Force GO role**: Calls `createGroup()` on the P2P channel. `startDiscoveryLoop()` is gated inside the createGroup callbacks (onSuccess/onFailure) with a 5s timeout fallback — this ensures the sink acts as GO rather than joining a foreign group as a client
-4. **startDiscoveryLoop()**: Schedules `discoverPeers()` every 10 seconds via Handler. On success, notifies `onDiscoveryStateChanged(true)`
-5. **requestConnectionInfo()**: Queries P2P group and connection info. When group is formed, stops discovery and notifies `onP2pGroupConnected(group, info)`
+4. **LISTEN/monitor serialization**: Framework listen, extended listen, discovery, and the optional supplicant monitor have one owner. A group-started event stops all pre-group work before readiness polling; duplicate events are ignored. If framework `startListening()` reports asynchronous failure, the manager tears down listen/monitor state and falls back to discovery.
+5. **Group/network readiness**: `P2P-GROUP-STARTED` is only a candidate. Each readiness poll refreshes group info and connection info in the Android-required order, then waits up to 6s for a formed group, a peer, an UP P2P interface, and a non-loopback IPv4 address before notifying the service.
+6. **Bounded retry**: A failed formation, readiness timeout, group loss, invitation fallback failure/stall, or pre-RTSP control-connect failure cleans up the old token, waits up to 2s for `requestGroupInfo()` to report no group, and retries after 500ms, at most three total attempts. Delayed callbacks from an old generation or attempt are ignored.
+7. **requestConnectionInfo()**: Queries the framework in its required order and notifies `onP2pGroupConnected(group, info, attemptId)` only after readiness.
 
-**WFD Information Element**:
-```
-WFD IE hex: 0151 001C 4432
-  Byte 0-1: 0151 — Device type (primary sink, session available, content protection support, P2P connectivity)
-  Byte 2-3: 001C — RTSP control port (7236 in WFD session context; IE byte interpretation is spec-version dependent)
-  Byte 4:   44   — Session availability
-  Byte 5:   32   — Max throughput = 50 Mbps (0x32 = 50 decimal)
-```
-
-Full `WFD_SUBELEM_SET` command: `00060151001C4432`
+**WFD Information Element:**
+`00111C440032` is the canonical default payload: `0011` device info,
+`1C44` session availability/throughput fields, and `0032` max throughput.
+At runtime `P2pManager` generates this from the framework `setWfdInfo()` API
+and the configured RTSP control port; it is not a hardcoded Xiaomi payload.
+The optional supplicant fallback is used when the framework call throws or its asynchronous `ActionListener` reports failure; setup is guarded so only one framework-or-fallback path runs.
 
 **Interface**:
 ```kotlin
 interface P2pListener {
-    fun onP2pGroupConnected(group: WifiP2pGroup, info: WifiP2pInfo)
-    fun onP2pGroupDisconnected()
+    fun onP2pGroupConnected(group: WifiP2pGroup, info: WifiP2pInfo, attemptId: Long)
+    fun onP2pGroupDisconnected(attemptId: Long)
+    fun onP2pAttemptFailed(attemptId: Long, reason: String) {}
+    fun onP2pAttemptExhausted(attemptId: Long, reason: String) {}
     fun onDiscoveryStateChanged(active: Boolean)
 }
 ```
+
+`WifiP2pManager` is asynchronous: group and connection details are requested only
+after a group indication, and RTSP is not started from the indication alone. This
+matches the Android API contract: [WifiP2pManager](https://developer.android.com/reference/android/net/wifi/p2p/WifiP2pManager)
+documents `requestGroupInfo()` followed by `requestConnectionInfo()`. If a future
+implementation adds `ConnectivityManager.NetworkCallback`, it must register each
+callback at most once and unregister it during cleanup, as required by
+[NetworkCallback](https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback).
 
 ### `P2pReceiver.kt` — P2P Connection Broadcast Receiver
 

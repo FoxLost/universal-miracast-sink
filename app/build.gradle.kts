@@ -12,8 +12,8 @@ android {
         applicationId = "foxlost.miracast.sink"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
     }
 
     buildTypes {
@@ -51,4 +51,6 @@ dependencies {
 
     // LSPosed API
     compileOnly("de.robv.android.xposed:api:82")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
+    testImplementation("junit:junit:4.13.2")
 }
