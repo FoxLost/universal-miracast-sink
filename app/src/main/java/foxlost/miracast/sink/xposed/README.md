@@ -15,13 +15,10 @@ WifiP2pServiceImpl.checkConfigureWifiDisplayPermission()
 ```
 This hook nullifies the signature-level permission check, allowing the app to call `setWfdInfo()` without the `CONFIGURE_WIFI_DISPLAY` permission.
 
-#### 2. WFD Device Info Injection
-```kotlin
-// Forces specific WFD IE hex into the supplicant
-SupplicantP2pIfaceHal.setWfdDeviceInfo("0151001C4432")
-WifiP2pNative.setWfdDeviceInfo("0151001C4432")
-```
-Injects our WFD capabilities hex directly into wpa_supplicant commands.
+#### 2. WFD Device Info
+The module does not inject a fixed vendor-specific WFD payload. The framework
+`setWfdInfo()` call remains the source of truth; any vendor fallback must use
+the session-generated canonical fields and configured RTSP control port.
 
 #### 3. WFD Enable Forcing
 ```kotlin
@@ -66,7 +63,7 @@ All hooks run in the `system_server` process context (UID 1000), allowing them t
 MiracastRoot: LSPosed module loaded for android
 MiracastRoot: Hooked checkConfigureWifiDisplayPermission
 MiracastRoot: Bypassed checkConfigureWifiDisplayPermission
-MiracastRoot: Injected WFD device info hex into supplicant
+MiracastRoot: Framework WFD device info remains authoritative
 MiracastRoot: Forced enableWfd(true)
 ```
 

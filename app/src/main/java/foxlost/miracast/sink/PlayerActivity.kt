@@ -18,6 +18,7 @@ import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import foxlost.miracast.sink.media.MediaDecoderPipeline
+import foxlost.miracast.sink.media.RtpEndpointRegistry
 import foxlost.miracast.sink.media.RtpReceiver
 import foxlost.miracast.sink.media.TsDemuxer
 import kotlin.math.max
@@ -38,8 +39,19 @@ class PlayerActivity : ComponentActivity(), TextureView.SurfaceTextureListener {
         }
     }
 
+    private val transportReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != MiracastService.ACTION_TRANSPORT_NEGOTIATED) return
+            if (intent.getLongExtra(MiracastService.EXTRA_SESSION_GENERATION, -1L) != sessionGeneration()) return
+            if (!intent.hasExtra(MiracastService.EXTRA_SSRC)) return
+            rtpReceiver?.expectedSsrc = intent.getLongExtra(MiracastService.EXTRA_SSRC, 0L)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SettingsManager.init(this)
+        startMediaReceiver()
         title = getString(R.string.app_name)
         if (Build.VERSION.SDK_INT >= 21) {
             setTaskDescription(android.app.ActivityManager.TaskDescription(getString(R.string.app_name)))
@@ -54,8 +66,23 @@ class PlayerActivity : ComponentActivity(), TextureView.SurfaceTextureListener {
         }
         setContentView(container)
         hideSystemBars()
-        registerReceiver(sessionEndReceiver, IntentFilter("foxlost.miracast.SESSION_END"),
-            Context.RECEIVER_NOT_EXPORTED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                sessionEndReceiver,
+                IntentFilter("foxlost.miracast.SESSION_END"),
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+            registerReceiver(
+                transportReceiver,
+                IntentFilter(MiracastService.ACTION_TRANSPORT_NEGOTIATED),
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(sessionEndReceiver, IntentFilter("foxlost.miracast.SESSION_END"))
+            @Suppress("DEPRECATION")
+            registerReceiver(transportReceiver, IntentFilter(MiracastService.ACTION_TRANSPORT_NEGOTIATED))
+        }
     }
 
     override fun onResume() {
@@ -91,19 +118,39 @@ class PlayerActivity : ComponentActivity(), TextureView.SurfaceTextureListener {
             runOnUiThread { onVideoSizeKnown(w, h) }
         }
         decoderPipeline?.initVideoDecoder()
+    }
 
-        val tsDemuxer = TsDemuxer(
-            onVideoNaluExtracted = { nalu, pts ->
-                decoderPipeline?.feedVideoNalu(nalu, pts)
-            },
-            onAudioFrameExtracted = { pcm, sr, ch ->
-                decoderPipeline?.playPcmAudio(pcm, sr, ch)
-            }
-        )
+    /**
+     * Bind RTP/RTCP before RTSP SETUP/PLAY. Sources are allowed to send the
+     * first datagram immediately after SETUP, before a surface is available.
+     */
+    private fun sessionGeneration(): Long =
+        intent.getLongExtra(MiracastService.EXTRA_SESSION_GENERATION, 0L)
 
-        rtpReceiver = RtpReceiver(15550, tsDemuxer)
-        rtpReceiver?.start()
-        Log.d("MiracastApp", "PlayerActivity created, RTP receiver started on port 15550")
+    private fun startMediaReceiver() {
+        val token = sessionGeneration().toString()
+        try {
+            val tsDemuxer = TsDemuxer(
+                onVideoNaluExtracted = { nalu, pts -> decoderPipeline?.feedVideoNalu(nalu, pts) },
+                onAudioFrameExtracted = { pcm, sr, ch -> decoderPipeline?.playPcmAudio(pcm, sr, ch) },
+            )
+            val rtpPort = intent.getIntExtra(MiracastService.EXTRA_RTP_PORT, SettingsManager.rtpVideoPort)
+            val rtcpPort = intent.getIntExtra(MiracastService.EXTRA_RTCP_PORT, rtpPort + 1)
+                .takeIf { it in 1..65535 }
+            rtpReceiver = RtpReceiver(
+                rtpPort = rtpPort,
+                tsDemuxer = tsDemuxer,
+                rtcpPort = rtcpPort,
+                sessionToken = token,
+            )
+            rtpReceiver?.start()
+            Log.d("MiracastApp", "RTP/RTCP receiver starting on $rtpPort/$rtcpPort before PLAY generation=$token")
+        } catch (e: Exception) {
+            RtpEndpointRegistry.clear(token)
+            try { rtpReceiver?.stop() } catch (_: Exception) {}
+            rtpReceiver = null
+            Log.e("MiracastApp", "RTP receiver startup failed generation=$token", e)
+        }
     }
 
     private fun onVideoSizeKnown(w: Int, h: Int) {
@@ -136,19 +183,24 @@ class PlayerActivity : ComponentActivity(), TextureView.SurfaceTextureListener {
     override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
         adjustViewSize()
     }
-
     override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-        rtpReceiver?.stop()
         decoderPipeline?.release()
+        decoderPipeline = null
         return true
+    }
+
+    override fun onDestroy() {
+        rtpReceiver?.stop()
+        rtpReceiver = null
+        decoderPipeline?.release()
+        decoderPipeline = null
+        super.onDestroy()
+        try { unregisterReceiver(sessionEndReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(transportReceiver) } catch (_: Exception) {}
     }
 
     override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
 
-    override fun onDestroy() {
-        super.onDestroy()
-        try { unregisterReceiver(sessionEndReceiver) } catch (e: Exception) {}
-    }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)

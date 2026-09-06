@@ -1,7 +1,7 @@
 # Adaptive Miracast Session Controller Design
 
 **Date:** 2026-09-05
-**Status:** Approved design (Opsi A); implementation is not included in this document.
+**Status:** Approved design; P2P stability implementation and validation status are recorded in §15.
 
 ## 1. Goal and scope
 
@@ -502,3 +502,26 @@ Passing a build alone is not acceptance. The implementation requires protocol tr
 - Transport, Session, ports, SSRC, RTCP, and media readiness are session-owned; `PlayerActivity` has no network authority.
 - Cancellation, EOF, timeout, malformed input, and teardown converge on one idempotent cleanup path.
 - No unresolved TODO, TBD, placeholder implementation, or unapproved feature claim remains. API 32+ scope and unsupported protocol features are explicit.
+
+## 15. Implementation status and self-review (2026-09-06)
+
+The approved P2P stability slice is implemented behind the existing
+`P2pManager`, `MiracastService`, and `AdaptiveSessionController` seams. It uses
+three total P2P attempts, a 500 ms inter-attempt delay, a bounded 6 s
+group/network readiness gate, serialized pre-group cleanup, and generation plus
+attempt guards. `P2P-GROUP-STARTED` alone never starts RTSP. Windows source-GO
+uses the validated group-owner address; Android sink-GO/source-client retains
+the ARP-based peer resolution path.
+
+Deterministic tests cover retry exhaustion and cleanup ordering, stale attempt
+and generation callbacks, readiness timeout/predicates, and both role paths.
+The full JVM unit-test task and release assembly were run. `git diff --check`
+was clean. Lint was run but remains blocked by existing project findings
+(API-30 WFD access under minSdk 29, Android 13 notification permission,
+manifest permission/receiver issues, and warnings); those findings are not
+silently suppressed by this implementation.
+
+Official API references used for the readiness/serialization decisions:
+
+- https://developer.android.com/reference/android/net/wifi/p2p/WifiP2pManager
+- https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback
