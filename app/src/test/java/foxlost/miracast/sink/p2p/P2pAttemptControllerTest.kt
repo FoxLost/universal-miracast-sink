@@ -61,4 +61,53 @@ class P2pAttemptControllerTest {
         assertTrue(controller.accepts(fresh))
         assertEquals(P2pAttemptController.FailureDecision.Ignored, controller.fail(old))
     }
+
+    @Test
+    fun restartingSameGenerationDoesNotReviveOldCallbacksOrCleanup() {
+        val controller = P2pAttemptController()
+        val previous = controller.start(7L)
+        controller.fail(previous)
+        val current = controller.start(7L)
+
+        assertTrue(current.attemptId > previous.attemptId)
+        assertEquals(1, current.number)
+        assertFalse(controller.accepts(previous))
+        assertFalse(controller.completeCleanup(previous))
+        assertFalse(controller.cancel(previous))
+        assertEquals(P2pAttemptController.FailureDecision.Ignored, controller.fail(previous))
+        assertTrue(controller.accepts(current))
+    }
+
+    @Test
+    fun cleanupCannotBeSkippedOrCompletedByAnEarlierAttempt() {
+        val controller = P2pAttemptController()
+        val first = controller.start(7L)
+        controller.fail(first)
+        assertNull(controller.beginNext())
+        assertTrue(controller.completeCleanup(first))
+        val second = requireNotNull(controller.beginNext())
+        controller.fail(second)
+
+        assertFalse(controller.completeCleanup(first))
+        assertNull(controller.beginNext())
+        assertTrue(controller.completeCleanup(second))
+        assertNotNull(controller.beginNext())
+    }
+
+    @Test
+    fun stopInvalidatesActiveAndPendingCleanupCallbacks() {
+        val controller = P2pAttemptController()
+        val first = controller.start(7L)
+        assertTrue(controller.cancel(first))
+        assertFalse(controller.accepts(first))
+        assertEquals(P2pAttemptController.FailureDecision.Ignored, controller.fail(first))
+
+        val second = controller.start(8L)
+        controller.fail(second)
+        assertTrue(controller.cancel(second))
+        assertFalse(controller.completeCleanup(second))
+        val replacement = controller.start(9L)
+        assertFalse(controller.cancel(second))
+        assertTrue(controller.accepts(replacement))
+    }
 }

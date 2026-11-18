@@ -1,6 +1,6 @@
-id=miracast-sink-system
-name=Miracast Sink (System Priv-App)
-version=v1.4
-versionCode=5
+id=miracast-sink-root
+name=Miracast Sink (On-Demand Root)
+version=v1.22
+versionCode=23
 author=foxlost
-description=Windows Miracast support, full WFD capability exchange, configurable settings, dual-mode P2P (GO intent 0/8)
+description=Optional normal-app installer; narrow root access only during sink sessions. No system overlay or boot service.

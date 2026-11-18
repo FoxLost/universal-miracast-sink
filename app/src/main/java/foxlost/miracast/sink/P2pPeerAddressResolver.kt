@@ -1,52 +1,82 @@
 package foxlost.miracast.sink
 
-/** Resolves a P2P client's IPv4 address from the kernel ARP table. */
+/** Resolves only the selected peer on the current P2P interface, within the control-startup window. */
 internal object P2pPeerAddressResolver {
     private val macPattern = Regex("^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
-    private val ipv4Pattern = Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
-
-    fun parseArpTable(contents: String): Map<String, String> = buildMap {
-        contents.lineSequence().forEach { line ->
-            val fields = line.trim().split(Regex("\\s+"))
-            if (fields.size < 4) return@forEach
-            val ip = fields[0]
-            val mac = fields[3].lowercase()
-            if (!ipv4Pattern.matches(ip) || !macPattern.matches(mac)) return@forEach
-            if (ip == "0.0.0.0" || mac == "00:00:00:00:00:00") return@forEach
-            put(mac, ip)
-        }
-    }
-
-    /**
-     * Read the ARP table from the normal app view first, then use a privileged
-     * reader when procfs permissions deny that view. Both readers are invoked
-     * at most once; the caller owns the bounded retry policy.
-     */
-    fun readTableWithFallback(
-        directReader: () -> String?,
-        rootReader: () -> String?,
-    ): String? {
-        val direct = runCatching { directReader() }.getOrNull()
-            ?.takeIf { it.isNotBlank() }
-        if (direct != null) return direct
-        return runCatching { rootReader() }.getOrNull()
-            ?.takeIf { it.isNotBlank() }
-    }
+    private val interfacePattern = Regex("^[a-zA-Z0-9_.-]{1,40}$")
+    private val whitespace = Regex("\\s+")
 
     fun resolveFromArp(
         peerMac: String,
+        interfaceName: String,
+        groupOwnerAddress: String?,
+        startedNanos: Long,
+        readInterfaceMac: () -> String?,
         readTable: () -> String?,
-        attempts: Int = 8,
-        retryDelayMs: Long = 250L,
+        isCurrent: () -> Boolean,
+        nowNanos: () -> Long = System::nanoTime,
         sleeper: (Long) -> Unit = { Thread.sleep(it) },
     ): String? {
-        val normalizedMac = peerMac.trim().lowercase()
-        if (!macPattern.matches(normalizedMac) || attempts <= 0) return null
-        repeat(attempts) { attempt ->
-            val address = readTable()?.let(::parseArpTable)?.get(normalizedMac)
+        val deviceMac = validMac(peerMac) ?: return null
+        if (!interfacePattern.matches(interfaceName)) return null
+        var interfaceMac: String? = null
+        fun active(): Boolean = !Thread.currentThread().isInterrupted && isCurrent() &&
+            remainingControlConnectMs(startedNanos, nowNanos()) > 0L
+        while (active()) {
+            if (interfaceMac == null) interfaceMac = readInterfaceMac()?.let(::validMac)
+            if (!active()) return null
+            val table = readTable()
+            if (!active()) return null
+            // An authoritative interface identity takes precedence over a potentially stale
+            // device-MAC row. Without one, only an exact device identity is eligible, never
+            // the first neighbor or a MAC manufactured by flipping address bits.
+            val address = table?.let {
+                findAddress(it, interfaceName, interfaceMac ?: deviceMac, groupOwnerAddress)
+            }
             if (address != null) return address
-            if (attempt + 1 < attempts && retryDelayMs > 0) sleeper(retryDelayMs)
+            val remaining = remainingControlConnectMs(startedNanos, nowNanos())
+            if (remaining <= 0L) return null
+            try {
+                sleeper(minOf(250L, remaining))
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
         }
         return null
+    }
+
+    private fun validMac(value: String): String? {
+        val mac = value.trim().lowercase()
+        if (!macPattern.matches(mac) || mac.substring(0, 2).toInt(16) and 1 != 0 ||
+            mac == "00:00:00:00:00:00") return null
+        return mac
+    }
+
+    private fun findAddress(contents: String, iface: String, mac: String, ownAddress: String?): String? {
+        var match: String? = null
+        for (line in contents.lineSequence()) {
+            val fields = line.trim().split(whitespace)
+            if (fields.size < 6 || fields[5] != iface || !fields[3].equals(mac, ignoreCase = true)) continue
+            val flags = fields[2].removePrefix("0x").toIntOrNull(16) ?: continue
+            if (flags and 2 == 0) continue // Incomplete neighbor entries are not readiness.
+            val ip = fields[0]
+            if (ip == ownAddress || !isUnicastIpv4(ip)) continue
+            if (match != null && match != ip) return null // Do not guess among multiple addresses.
+            match = ip
+        }
+        return match
+    }
+
+    private fun isUnicastIpv4(value: String): Boolean {
+        val octets = value.split('.')
+        if (octets.size != 4) return false
+        for ((index, octet) in octets.withIndex()) {
+            if (octet.isEmpty() || octet.length > 3 || (octet.length > 1 && octet[0] == '0') ||
+                octet.any { it !in '0'..'9' }) return false
+            val number = octet.toInt()
+            if (number !in 0..255 || (index == 0 && (number !in 1..223 || number == 127))) return false
+        }
+        return true
     }
 }

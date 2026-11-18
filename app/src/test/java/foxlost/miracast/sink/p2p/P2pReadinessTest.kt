@@ -29,4 +29,25 @@ class P2pReadinessTest {
             gate.evaluate(1_000L, groupFormed = true, peerPresent = true, interfaceUp = true, ipv4Present = true),
         )
     }
+
+    @Test
+    fun remoteSourceCanBecomeReadyAfterGroupCreationWithoutPrematureFailure() {
+        assertEquals(
+            GroupReadinessGate.Result.Waiting,
+            gate.evaluate(159L, groupFormed = true, peerPresent = false, interfaceUp = true, ipv4Present = true),
+        )
+        assertEquals(
+            GroupReadinessGate.Result.Ready,
+            gate.evaluate(3_500L, groupFormed = true, peerPresent = true, interfaceUp = true, ipv4Present = true),
+        )
+    }
+
+    @Test
+    fun readySnapshotCannotBypassAnExpiredReadinessDeadline() {
+        assertEquals(
+            GroupReadinessGate.Result.TimedOut,
+            gate.evaluate(6_000L, groupFormed = true, peerPresent = true, interfaceUp = true, ipv4Present = true),
+        )
+    }
+
 }

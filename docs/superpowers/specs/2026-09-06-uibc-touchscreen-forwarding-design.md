@@ -1,7 +1,15 @@
 # UIBC Touchscreen Forwarding Design
 
 **Date:** 2026-09-06  
-**Status:** Approved design; implementation is not included in this document.
+**Status:** Historical original Generic-only design. The REA-driven implementation revision below supersedes its HIDC exclusions.
+
+**Implementation revision:** The application now supports source-selected Generic
+and HIDC USB touchscreen descriptors/reports, gesture-safe bounded queues and
+neutral release, plus RTP loss/IDR recovery and audio-master presentation timing.
+The current implemented contract and hardware limitations are documented in the
+root README and package READMEs. The sections below retain the original design
+for historical context; they are not claims that physical interoperability has
+been verified.
 
 ## 1. Goal and scope
 

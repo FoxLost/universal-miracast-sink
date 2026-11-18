@@ -40,7 +40,7 @@ internal class P2pAttemptController(
     fun start(newGeneration: Long): Token {
         generation = newGeneration
         attemptCount = 0
-        nextAttemptId = 0L
+        // Keep callback identities unique even when a caller reuses its generation.
         active = null
         cleanupPendingFor = null
         return beginNext()
@@ -59,6 +59,8 @@ internal class P2pAttemptController(
     }
 
     fun accepts(token: Token): Boolean = active == token
+
+    fun isCleanupPending(token: Token): Boolean = cleanupPendingFor == token
 
     fun fail(token: Token): FailureDecision {
         if (active != token) return FailureDecision.Ignored

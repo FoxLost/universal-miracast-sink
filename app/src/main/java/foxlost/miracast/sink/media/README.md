@@ -1,89 +1,51 @@
 # Media Package (`media`)
 
-RTP packet reception, MPEG-TS demultiplexing, H.264 video decoding, and LPCM audio playback.
+UDP MPEG-TS/RTP reception, H.264 access-unit decoding, and 48 kHz stereo PCM16 playback. This package does not implement AAC, HEVC, HDCP, WFD2, or TCP media transport.
 
-## Files
+## Reception and loss recovery
 
-### `RtpReceiver.kt` — UDP RTP Packet Receiver
+`RtpReceiver` validates RTP version, CSRC/extension/padding lengths and MPEG-TS payload type 33. The negotiated SSRC is enforced; before an SSRC is negotiated, the first accepted source is pinned. Updating the expected SSRC explicitly starts a new sequence epoch rather than mixing streams.
 
-Binds a `DatagramSocket` on the specified port (default 15550) with `reuseAddress=true` and a 2MB receive buffer. Strips the 12-byte RTP header and passes payload data to `TsDemuxer`.
+The socket reader owns no decoder work. It transfers ownership of pooled datagram buffers to a bounded media queue (128 buffers, each supporting a full UDP datagram). `RtpReorderBuffer` uses 64 preallocated slots, modulo-65536 sequence arithmetic and a 40 ms gap deadline. Reordered packets are delivered in sequence, duplicates/late packets are discarded, and confirmed missing sequence numbers are counted once. A 10 ms idle poll advances an expired gap even if no further datagram arrives. A packet beyond the window advances the window while preserving retained predecessors. Buffer exhaustion drops incoming datagrams without blocking socket reception and resets demux continuity on the media worker.
 
-**Details**:
-- Listens on `0.0.0.0:15550` (all interfaces)
-- Buffer: 65535 bytes per packet (jumbo frame capable)
-- Skips minimum RTP header (12 bytes)
-- Thread: `RtpReceiverThread` runs receive loop
-- Graceful shutdown via `isRunning` volatile flag
+`receivedPackets` counts accepted-source arrivals (including duplicates), `duplicatePackets` counts duplicate or late sequence numbers, `lostPackets` counts confirmed absent sequence numbers, `rejectedSsrcPackets` counts other-source arrivals, and `droppedDatagrams` counts local pool/queue overload. Counters are cumulative for the receiver instance. A discontinuity callback requests recovery; RTSP owns IDR request throttling and response handling.
 
-### `TsDemuxer.kt` — MPEG-TS Demultiplexer
+Receiver retirement is single-shot. Stop closes both owned sockets immediately and interrupts the media worker without joining on the UI thread. Readiness is cleared by receiver identity, so an old worker's finalizer cannot unpublish a replacement in the same session. Native port release may lag `DatagramSocket.close()` until a blocked receive returns; a new receiver waits at most one second for overlapping retired transports to finish. Player startup runs that wait/bind off the UI thread, and stopping a waiting replacement does not wait on its startup monitor. The closing-port barrier survives session-token resets until every old worker exits. A stopped receiver cannot restart.
 
-Parses MPEG Transport Stream (188-byte packets with 0x47 sync byte) carried in RTP payloads. Auto-detects video and audio PIDs from PES stream headers.
+Real loopback stress completed 60 same-port ownership transfers (30 RTP-only, 30 RTP+RTCP), including actual packet delivery, rejected concurrent binds, duplicate Stop and late cleanup. This reproduces a deferred-close rebind failure before the barrier and passes afterward; it does not test physical P2P transport.
 
-**PID Auto-Detection**:
-| Stream Type | Stream ID Range | Detection |
-|---|---|---|
-| H.264 Video | 0xE0–0xEF | First non-PAT/PMT PES with video stream ID |
-| Audio (LPCM/AAC) | 0xC0–0xDF or 0xBD | Subsequent PES with audio stream ID |
+## MPEG-TS demux
 
-**Video Processing**:
-1. Accumulates PES payload across multiple TS packets
-2. On each `payload_start_indicator`, flushes accumulated data
-3. Extracts Annex-B NAL units (0x00000001 or 0x000001 delimiters)
-4. Outputs individual NAL units with PTS timestamps
+`TsDemuxer` handles fragmented 188-byte transport packets, PAT/PMT sections, PTS-bearing PES headers and bounded PES assembly (4 MiB maximum). Declared nonzero PES lengths complete immediately; a new PES start discards an incomplete finite predecessor rather than emitting truncated video/PCM. Zero-length video PES completes at the next PES start. The source's H.264 PES access unit is retained intact, including SPS/PPS and all frame slices, rather than submitting each NAL as a separate decoder frame.
 
-**Audio Processing**:
-1. Accumulates PES payload across multiple TS packets
-2. On each `payload_start_indicator`, flushes accumulated data
-3. **Skips 4-byte LPCM audio descriptor** (emphasis, mute, frame_count, quant_word_length) from PES payload header
-4. **Swaps endianness**: MPEG-TS LPCM is big-endian, Android `AudioTrack` expects little-endian 16-bit PCM
-5. Passes to `onAudioFrameExtracted(pcmData, 48000, 2)`
+Unknown RTP loss and local datagram overload discard global partial TS/PSI/PES state. Known TS errors are scoped to PAT, selected PMT, or selected elementary-stream PID: audio/PSI damage cannot purge healthy video or request an IDR. Null PID `0x1fff` and unrelated PIDs cannot fabricate media discontinuities. Selected-video loss, truncation or mapping changes suppress dependent pictures until an IDR; audio errors discard only partial audio. Duplicate payload counters are ignored, adaptation-only packets do not advance continuity, and explicit discontinuity indicators apply to their own PID.
 
-**Architecture Issue**: Early versions had audio PID detection gated behind `videoPid == -1`, meaning audio would never be detected after video PID was found. Fixed by separating the detection blocks.
+Only WFD LPCM stream type 0x83 is selected from PMT. The private LPCM header must indicate 16-bit, 48 kHz stereo (`0xa0` substream and format byte `0x11`). Samples are converted from big endian to PCM16 little endian. Unsupported/compressed data is not passed to AudioTrack.
 
-### `MediaDecoderPipeline.kt` — H.264 Decoder + AudioTrack
+Callbacks:
 
-Manages the hardware H.264 video decoder and audio playback.
+- `onVideoNaluExtracted(accessUnit: ByteArray, ptsUs: Long)` transfers ownership of one complete Annex-B PES access unit (the historical callback name is retained).
+- `onAudioFrameExtracted(pcmData: ByteArray, sampleRate: Int, channels: Int, ptsUs: Long)` carries the actual audio PES timestamp.
+- `onDiscontinuity()` requests video-reference recovery through the integration layer; known audio/PSI damage is not a video recovery request. Global `discontinuity()` is explicitly caller-owned.
 
-**Video Decoder**:
-1. Creates `MediaFormat` for `video/avc` at 1920x1080
-2. Tries hardware decoder first: `MediaCodec.createDecoderByType("video/avc")`
-3. Falls back to software: `c2.android.avc.decoder` → `OMX.google.h264.decoder`
-4. Configures with Surface (for direct rendering, no buffer copying)
-5. Reports video dimensions via `onVideoSizeChanged` callback (from `outputFormat.width/height`)
-6. Debug output: `Hardware H.264 MediaCodec started successfully (OMX.qcom.video.decoder.avc)`
+## Decoder and common playback timing
 
-**Audio Playback**:
-1. Initializes `AudioTrack` with STREAM_MUSIC, 48kHz, stereo, PCM_16BIT
-2. Writes PCM data via `audioTrack.write()` (streaming mode)
-3. Buffer size: 2× minimum buffer
+`WfdAvcFormats` advertises one exact selected progressive CEA timing: 1280×720p30/p60 or 1920×1080p30/p60. Every advertised AVC profile contains only that timing, backed by a decoder that supports its dimensions/rate and the required H.264 level. The native byte packs the selected index into bits 7:3, with CEA table selector 0 in bits 2:0 (WFD v2.1 Table 37). VGA/480p/576p, 24/25/50 Hz, VESA/HH/interlaced modes and alternate resolution/FPS fallbacks are excluded. Unsupported choices return `none`; an unavailable settings store cannot reintroduce VGA. This forced-HD policy intentionally omits WFD's mandatory base modes and may be rejected by otherwise compliant senders. Source M4 selections outside the exact offer are rejected. Codec metadata and negotiation do not guarantee sustained real-time playback; renderer and touch mapping behavior are unchanged.
 
-## RTP → Decoded Output Pipeline
+`MediaDecoderPipeline` waits for a valid SPS profile, level and dimensions before selecting a decoder. It tries only eligible registered AVC decoders, with hardware ahead of software and `findDecoderForFormat` preferred within each group. Hardware preference never relaxes the source's SPS level/profile or invents an eligible vendor codec; software remains necessary when no hardware candidate supports the actual stream. On API 30+, low-latency decoding is requested only when the candidate advertises `FEATURE_LowLatency`; rejection of that optional hint retries ordinary configuration on the same eligible decoder before moving to another. Failed instances are released independently of stop failures. Decoder crop coordinates, when valid, determine the visible size: a 1920x1088 coded frame cropped to row 1079 is reported as 1920x1080.
 
-```
-UDP Packet (RTP)
-    │  strip 12-byte RTP header
-    ▼
-MPEG-TS payload (188-byte packets with 0x47 sync)
-    │  PES reassembly across TS packets
-    ▼
-┌─────────────────────────────────────────┐
-│ H.264 NAL Units (video)                 │
-│   → MediaCodec (OMX.qcom H.264 HW)     │
-│   → Surface (direct render)             │
-├─────────────────────────────────────────┤
-│ LPCM Audio Frames (48kHz, 2ch, 16-bit)  │
-│   → Skip 4-byte descriptor              │
-│   → BE→LE byte swap                     │
-│   → AudioTrack (STREAM_MUSIC)           │
-└─────────────────────────────────────────┘
-```
+`SurfaceVideoBuffer` bridges RTP arriving before the render surface. It retains references to bounded SPS/PPS/random-access access units, not an unbounded frame queue. A dropped predictive reference chain invalidates the cached IDR; recovery is requested before parameter replay. Surface installation and replay are serialized against incoming video. SPS/PPS can pass the recovery gate while predictive frames remain suppressed until a fresh IDR.
 
-## Known Issues & Resolutions
+`MediaDecoderPipeline.feedVideoNalu` enqueues whole access units, bounded by 32 entries and 8 MiB encoded data, plus one worker-owned pending AU. This accommodates continuous 60 fps ingress during a 300 ms output hold without abandoning predictive references. The worker drains ready output before attempting nonblocking input; temporary input unavailability retains the exact AU. Sustained input blockage has a 500 ms deadline, paused while output is intentionally held for presentation. Queue/byte exhaustion or real input loss requests IDR recovery. Clock-generation changes discard stale decoded output, never compressed input solely because its presentation epoch changed.
 
-| Issue | Resolution |
-|---|---|
-| `KEY_LOW_LATENCY=1` crashed QCOM OMX decoder | Removed from MediaFormat — not supported on Snapdragon 625 |
-| Audio PID never detected | Moved audio PID detection outside `videoPid == -1` guard |
-| Static noise on audio | Added BE→LE endian swap (MPEG-TS LPCM is big-endian) |
-| Distorted audio with endian swap | Added 4-byte LPCM descriptor skip in PES payload |
-| Audio descriptor skip caused regression | Confirmed: needs both skip AND swap |
+IDR admission and reference-epoch replacement share the queue monitor. A producer blocked before recovery cannot enqueue dependent input into the replacement epoch; callbacks execute after releasing queue ownership. Host smoke reproduces the former race and checks that only a fresh IDR reopens predictive admission.
+
+`playPcmAudio(pcmData, sampleRate, channels, ptsUs)` enqueues PCM to a separate queue capped at 32 entries and 200 ms sample duration. Pressure evicts old work in favor of fresh PCM; PTS freshness includes pending partial packets and wrap. Nonblocking partial writes retain their offsets and the original enqueue-based 200 ms deadline, so queue residence cannot add another retry allowance. The device buffer is sized toward 200 ms and primed before `play()`. API 31+ requests a start threshold up to 100 ms and reads it back; older devices use the effective buffer size. The device write budget is `max(200 ms, reported start threshold)` so a rounded legacy minimum above 200 ms can actually start; that exception increases device latency, not the software queue/deadline. Packet loss, lateness and overload preserve a healthy AudioTrack; only format/generation changes or actual device errors replace it. Lazy two-second diagnostics report device underruns, queued frames and timestamp validity.
+
+`PlaybackClock` maps both streams' 33-bit PTS values to a common monotonic timeline with 60 ms startup lead. Fresh ingress discovers forward/backward discontinuities over two seconds. Queued work uses atomic generation checks and cannot reanchor a newer timeline. PCM is fed from `sourceTimeUs`, never scheduled from the delayed playback head it must itself replenish. Recent progressing AudioTrack timestamps remain the video master, with playback-head fallback; a stalled head expires instead of sliding video targets indefinitely. The video worker owns at most one decoded output, waits outside media locks, then submits it when due using boolean render release for TextureView rather than assuming SurfaceView-only timed-release behavior. Output over 100 ms late is dropped without damaging references. Current-generation output over 500 ms ahead reanchors both streams instead of holding codec buffers for seconds; normal 300 ms lead remains scheduled. Reset/release clears queued audio, timing and owned output; codec stop failures cannot skip release.
+
+Regression tests cover decoder-advertisement boundaries, SPS parsing, pre-surface reference chains, RTP sequence/wrap/deadlines, per-PID TS isolation, null padding, finite-PES truncation/completion, zero-length video, PSI mapping changes, LPCM conversion, queued-generation rejection, backward restart, stalled audio expiry, excessive-lead recovery and PCM duration/freshness. Production-path host smoke additionally exercises actual workers with Android adapters: busy-to-ready input, continuous 60 fps with 300 ms early output, late output, partial PCM writes, overload, generation isolation, codec hint fallback and stop-failure cleanup. Real loopback UDP crosses RTP reorder, demux and decoder submission. Physical AudioTrack/MediaCodec/SurfaceTexture behavior, Wi-Fi and source-generated IDR response remain device checks.
+
+LPCM header reference: [AOSP Converter.cpp (Android 4.4)](https://android.googlesource.com/platform/frameworks/av/+/android-4.4_r1/media/libstagefright/wifi-display/source/Converter.cpp).
+
+Streaming priming and API 31 threshold behavior follow [AudioTrack.play and start-threshold documentation](https://developer.android.com/reference/android/media/AudioTrack#play()). Host PCM smoke uses a rounded 11,520-frame buffer with partial/zero writes: continuous API 30/36 runs each feed 57,600 frames with no underruns. An interrupted-source run preserves the same track and feeds all frames but may underrun; these checks do not claim that missing upstream audio or physical driver stalls are repaired.

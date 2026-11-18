@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
+import foxlost.miracast.sink.p2p.P2pBand
 
 /**
  * Central store for every user-tunable Miracast sink parameter.
@@ -31,6 +32,7 @@ object SettingsManager {
         if (initialized) return
         appContext = context.applicationContext
         prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        migrateVideoPreferences(prefs)
         initialized = true
     }
 
@@ -46,7 +48,10 @@ object SettingsManager {
     const val KEY_GO_INTENT_CLIENT = "go_intent_client"
     const val KEY_GO_INTENT_FALLBACK = "go_intent_fallback"
     const val KEY_FORCE_AUTONOMOUS_GO = "force_autonomous_go"
-    const val KEY_VIDEO_PROFILE = "video_profile"
+    private const val LEGACY_VIDEO_PROFILE = "video_profile"
+    const val KEY_VIDEO_HEIGHT = "video_height"
+    const val KEY_VIDEO_FPS = "video_fps"
+    const val KEY_WIFI_BAND = "wifi_band"
     const val KEY_AUDIO_ENABLED = "audio_enabled"
     const val KEY_UIBC_ENABLED = "uibc_enabled"
     const val KEY_MAX_THROUGHPUT = "max_throughput"
@@ -62,10 +67,18 @@ object SettingsManager {
     const val DEFAULT_GO_INTENT_FALLBACK = 8
     const val DEFAULT_MAX_THROUGHPUT = 50
 
-    // ---- Video profiles ----
-    const val PROFILE_FULL = 0       // Pad 6 default: CBP L3.1, CEA up to 1080p60
-    const val PROFILE_1080P30 = 1    // CEA up to 1080p30
-    const val PROFILE_720P60 = 2     // CEA up to 720p60
+    /**
+     * Remove the legacy preset in the same transaction as its replacement. Existing
+     * independent choices win, including after an upgrade with partially saved settings.
+     */
+    internal fun migrateVideoPreferences(preferences: SharedPreferences) {
+        if (!preferences.contains(LEGACY_VIDEO_PROFILE)) return
+        val legacy = preferences.getInt(LEGACY_VIDEO_PROFILE, 0)
+        val edit = preferences.edit()
+        if (!preferences.contains(KEY_VIDEO_HEIGHT)) edit.putInt(KEY_VIDEO_HEIGHT, if (legacy == 2) 720 else 1080)
+        if (!preferences.contains(KEY_VIDEO_FPS)) edit.putInt(KEY_VIDEO_FPS, if (legacy == 1) 30 else 60)
+        edit.remove(LEGACY_VIDEO_PROFILE).apply()
+    }
 
     // ---- Device name ----
 
@@ -84,15 +97,6 @@ object SettingsManager {
                 Log.d(TAG, "global settings '$key' unreadable: ${e.message}")
             }
         }
-        // Last resorts: dumpsys p2p name, then the model.
-        try {
-            val dump = Runtime.getRuntime().exec(arrayOf("dumpsys", "wifi"))
-                .inputStream.bufferedReader().readText()
-            Regex("wifi_p2p_device_name=([^\n\r]+)").find(dump)?.let {
-                val n = it.groupValues[1].trim()
-                if (n.isNotBlank()) return n
-            }
-        } catch (_: Exception) {}
         return Build.MODEL
     }
 
@@ -110,6 +114,9 @@ object SettingsManager {
             checkInit()
             prefs.edit().putString(KEY_DEVICE_NAME_OVERRIDE, value.trim()).apply()
         }
+
+    val deviceNameOverride: String
+        get() { checkInit(); return prefs.getString(KEY_DEVICE_NAME_OVERRIDE, "")?.trim().orEmpty() }
 
     var manufacturer: String
         get() { checkInit(); return prefs.getString(KEY_MANUFACTURER, Build.MANUFACTURER) ?: Build.MANUFACTURER }
@@ -145,14 +152,31 @@ object SettingsManager {
         set(value) { checkInit(); prefs.edit().putBoolean(KEY_FORCE_AUTONOMOUS_GO, value).apply() }
 
     // ---- Media ----
-    var videoProfile: Int
-        get() { checkInit(); return prefs.getInt(KEY_VIDEO_PROFILE, PROFILE_FULL) }
-        set(value) { checkInit(); prefs.edit().putInt(KEY_VIDEO_PROFILE, value).apply() }
+    var videoHeight: Int
+        get() { checkInit(); return if (prefs.getInt(KEY_VIDEO_HEIGHT, 1080) == 720) 720 else 1080 }
+        set(value) {
+            checkInit()
+            require(value == 720 || value == 1080)
+            prefs.edit().putInt(KEY_VIDEO_HEIGHT, value).apply()
+        }
+
+    var videoFps: Int
+        get() { checkInit(); return if (prefs.getInt(KEY_VIDEO_FPS, 60) == 30) 30 else 60 }
+        set(value) {
+            checkInit()
+            require(value == 30 || value == 60)
+            prefs.edit().putInt(KEY_VIDEO_FPS, value).apply()
+        }
+
+    var wifiBand: P2pBand
+        get() { checkInit(); return P2pBand.fromPreference(prefs.getString(KEY_WIFI_BAND, null)) }
+        set(value) { checkInit(); prefs.edit().putString(KEY_WIFI_BAND, value.name).apply() }
 
     var audioEnabled: Boolean
         get() { checkInit(); return prefs.getBoolean(KEY_AUDIO_ENABLED, true) }
         set(value) { checkInit(); prefs.edit().putBoolean(KEY_AUDIO_ENABLED, value).apply() }
 
+    /** Allow optional source-negotiated Generic UIBC touch forwarding; off by default. */
     var uibcEnabled: Boolean
         get() { checkInit(); return prefs.getBoolean(KEY_UIBC_ENABLED, false) }
         set(value) { checkInit(); prefs.edit().putBoolean(KEY_UIBC_ENABLED, value).apply() }
@@ -161,9 +185,9 @@ object SettingsManager {
         get() { checkInit(); return prefs.getInt(KEY_MAX_THROUGHPUT, DEFAULT_MAX_THROUGHPUT) }
         set(value) { checkInit(); prefs.edit().putInt(KEY_MAX_THROUGHPUT, value).apply() }
 
-    /** Android convention: send a second PLAY ~200ms after the first. */
+    /** Opt-in source quirk only. Standard WFD starts streaming after the first successful PLAY. */
     var secondPlay: Boolean
-        get() { checkInit(); return prefs.getBoolean(KEY_SECOND_PLAY, true) }
+        get() { checkInit(); return prefs.getBoolean(KEY_SECOND_PLAY, false) }
         set(value) { checkInit(); prefs.edit().putBoolean(KEY_SECOND_PLAY, value).apply() }
 
     /**
@@ -175,12 +199,10 @@ object SettingsManager {
         set(value) { checkInit(); prefs.edit().putBoolean(KEY_PERSISTENT_LISTEN, value).apply() }
 
     /**
-     * Disconnect Wi-Fi STA when entering Miracast sink mode. Eliminates the
-     * single-radio channel conflict (STA on ch5 vs P2P on ch11) that causes
-     * extended-listen windows to be skipped and GO-neg frames to arrive during
-     * IDLE gaps. With STA disconnected, P2P has the full radio on the listen
-     * channel and the 10/10 ms extended-listen windows (forced by the Xposed
-     * hook) are never skipped due to concurrency.
+     * Disconnect Wi-Fi STA during a sink session to reduce single-radio channel
+     * contention with P2P. The on-demand root bridge restores the networks it
+     * disabled when the session ends. Extended-listen overrides are separately
+     * controlled by extListenMs; no framework-wide hook changes other clients.
      */
     var disconnectWifiInSinkMode: Boolean
         get() { checkInit(); return prefs.getBoolean(KEY_DISCONNECT_WIFI, true) }
@@ -198,21 +220,20 @@ object SettingsManager {
         get() { checkInit(); return prefs.getInt(KEY_EXT_LISTEN_MS, 0) }
         set(value) { checkInit(); prefs.edit().putInt(KEY_EXT_LISTEN_MS, value.coerceIn(0, 5000)).apply() }
 
-    /** wfd_video_formats bitmap for the chosen profile (Pad 6 encoding). */
-    fun videoFormatsForProfile(): String {
-        return when (videoProfile) {
-            // CEA bitmap with modes up to 1080p30 only (bit 13 cleared)
-            PROFILE_1080P30 ->
-                "00 00 01 10 00001de1 00300000 000003c0 00 0000 0000 00 none none, " +
-                "02 10 00001de1 00300000 000003c0 00 0000 0000 00 none none"
-            // CEA bitmap limited to 720p and below
-            PROFILE_720P60 ->
-                "00 00 01 10 000011e1 00300000 000003c0 00 0000 0000 00 none none, " +
-                "02 10 000011e1 00300000 000003c0 00 0000 0000 00 none none"
-            // Full Pad 6 default (includes 1080p60)
-            else ->
-                "00 00 01 10 0001bde1 00300000 000003c0 00 0000 0000 00 none none, " +
-                "02 10 0001bde1 00300000 000003c0 00 0000 0000 00 none none"
-        }
+    /** Numeric/enum settings only: never include device identity in diagnostics. */
+    internal fun diagnosticSnapshot(): String {
+        val height = videoHeight
+        return "savedBand=${wifiBand.name} videoWidth=${if (height == 720) 1280 else 1920} " +
+            "videoHeight=$height nominalFps=$videoFps localMaxThroughputMbps=$maxThroughput " +
+            "rtspPort=$rtspPort rtpPort=$rtpVideoPort audioEnabled=$audioEnabled"
     }
+
+    /** Called only after Save accepts the draft; apply() does not promise disk durability. */
+    internal fun logAppliedSettings() {
+        Log.i(TAG, "Settings Save applied ${diagnosticSnapshot()}")
+    }
+
+    /** Progressive CEA modes bounded by independent user choices and actual AVC decoders. */
+    fun videoFormats(): String =
+        foxlost.miracast.sink.media.WfdAvcFormats.forPreference(videoHeight, videoFps)
 }

@@ -1,13 +1,18 @@
 package foxlost.miracast.sink.rtsp
 
+import android.util.Log
 import foxlost.miracast.sink.DebugEventCategory
 import foxlost.miracast.sink.DebugEventLog
 import foxlost.miracast.sink.AdaptiveProfileSelector
 import foxlost.miracast.sink.CompatibilityProfile
-import foxlost.miracast.sink.P2pRole
 import foxlost.miracast.sink.RtspEntry
 import foxlost.miracast.sink.SourceEvidence
 import foxlost.miracast.sink.SourceKind
+import foxlost.miracast.sink.uibc.UibcCapabilityParser
+import foxlost.miracast.sink.uibc.UibcCapabilityParseResult
+import foxlost.miracast.sink.uibc.UibcEndpoint
+import foxlost.miracast.sink.uibc.UibcSetting
+import foxlost.miracast.sink.uibc.UibcSettingParseResult
 import java.io.OutputStream
 import java.net.Socket
 import java.nio.charset.StandardCharsets
@@ -15,6 +20,26 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+
+private const val UIBC_LOG_TAG = "MiracastUIBC"
+
+private fun rtspUibcLogDebug(message: String) {
+    try { Log.d(UIBC_LOG_TAG, message) } catch (_: RuntimeException) {}
+}
+
+private fun rtspUibcLogInfo(message: String) {
+    try { Log.i(UIBC_LOG_TAG, message) } catch (_: RuntimeException) {}
+}
+
+private fun rtspUibcLogWarn(message: String) {
+    try { Log.w(UIBC_LOG_TAG, message) } catch (_: RuntimeException) {}
+}
+
+private fun rtspMediaLog(message: String) {
+    // Android's logging stub throws in host transcript tests, as with the UIBC logs.
+    try { Log.i("MiracastRTSP", message) } catch (_: RuntimeException) {}
+    DebugEventLog.record(DebugEventCategory.WFD, message)
+}
 
 /** The local RTP/RTCP endpoint that is ready before RTSP SETUP. */
 data class LocalRtpEndpoint(val rtpPort: Int, val rtcpPort: Int?)
@@ -36,6 +61,8 @@ interface RtspSessionCallbacks {
     fun onPlay(generation: Long)
     fun onProfile(generation: Long, profile: CompatibilityProfile)
     fun onSessionEnded(generation: Long, reason: String)
+    fun onUibcEndpoint(generation: Long, endpoint: foxlost.miracast.sink.uibc.UibcEndpoint) = Unit
+    fun onUibcDisabled(generation: Long, reason: String) = Unit
 
     companion object {
         val NONE = object : RtspSessionCallbacks {
@@ -49,11 +76,7 @@ interface RtspSessionCallbacks {
     }
 }
 
-/**
- * One WFD RTSP state machine used by both accepted source connections and the
- * sink's reverse connection to a source GO. Entry direction changes the first
- * transport transaction, not the message parser or cleanup semantics.
- */
+/** WFD sink control state machine. TCP direction never changes WFD RTSP roles. */
 class RtspSessionEngine(
     private val socket: Socket,
     private val generation: Long,
@@ -61,31 +84,84 @@ class RtspSessionEngine(
     private val entry: RtspEntry,
     initialProfile: CompatibilityProfile,
     private val callbacks: RtspSessionCallbacks,
+    private val nanoTime: () -> Long = System::nanoTime,
+    private val capabilitySnapshot: (Int) -> String = { WfdCapabilities.fullResponse(it) },
 ) {
     private val cseq = AtomicInteger(1)
-    private val pending = ConcurrentHashMap<Int, String>()
+    private data class PendingRequest(
+        val method: String,
+        val optional: Boolean = false,
+        val sentAtNanos: Long,
+    )
+    private val pending = ConcurrentHashMap<Int, PendingRequest>()
     private val finishOnce = AtomicBoolean(false)
     private val setupOnce = AtomicBoolean(false)
-    private val inboundSetupOnce = AtomicBoolean(false)
+    private var optionsComplete = false
+    private var selectedPresentation = false
+    private var selectedVideo = false
+    private var selectedAudio = false
+    private var advertisedCapabilities: String? = null
+    @Volatile private var lastSourceRequestNanos = nanoTime()
+    @Volatile private var lastKeepaliveNanos = nanoTime()
+    @Volatile private var sourceTimeoutNanos = 60_000_000_000L
+    @Volatile private var inboundRequestNanos = Long.MIN_VALUE
     private val sinkOptionsOnce = AtomicBoolean(false)
     private var output: OutputStream? = null
     private var profile = initialProfile
+    private var uibcCapabilities: Set<foxlost.miracast.sink.uibc.UibcCapability> = emptySet()
+    private var uibcPort: Int? = null
+    private var uibcSetting: UibcSetting? = null
+    private var uibcEndpointPublished = false
+    private var uibcCategory = foxlost.miracast.sink.uibc.UibcCategory.GENERIC
+    private var uibcPath: foxlost.miracast.sink.uibc.UibcInputPath? = null
+    private var uibcHidType: foxlost.miracast.sink.uibc.UibcCapability? = null
     private var presentationUrl = "rtsp://$sourceIp/wfd1.0/streamid=0"
-    private var sessionId: String? = null
+    @Volatile private var sessionId: String? = null
     private var localEndpoint: LocalRtpEndpoint? = null
     private var secondPlaySent = false
     @Volatile private var running = false
+    @Volatile private var playing = false
+    private var lastIdrRequestNanos = Long.MIN_VALUE
+
+    private data class PendingUibcUpdate(
+        val capability: UibcCapabilityParseResult? = null,
+        val setting: UibcSettingParseResult? = null,
+    ) {
+        val present: Boolean get() = capability != null || setting != null
+    }
 
     fun start() {
-        if (running) return
+        if (running || finishOnce.get()) return
         try {
             DebugEventLog.record(
                 DebugEventCategory.RTSP,
                 "RTSP ${entry.name.lowercase()} session started peer=$sourceIp",
             )
             output = socket.getOutputStream()
+            lastSourceRequestNanos = nanoTime()
             running = true
             thread(name = "RTSP-Session-$generation-$sourceIp") { readLoop() }
+            thread(name = "RTSP-Deadline-$generation", isDaemon = true) {
+                while (running) {
+                    Thread.sleep(250)
+                    val now = nanoTime()
+                    val expired = pending.entries.firstOrNull {
+                        now - it.value.sentAtNanos >= 5_000_000_000L
+                    }
+                    if (expired != null && pending.remove(expired.key, expired.value) && !expired.value.optional) {
+                        finish("${expired.value.method} response timeout")
+                    }
+                    val inboundStarted = inboundRequestNanos
+                    if (running && inboundStarted != Long.MIN_VALUE && now - inboundStarted >= 5_000_000_000L) {
+                        finish("sink response timeout")
+                    }
+                    val sourceDeadline = if (sessionId == null) 6_000_000_000L else sourceTimeoutNanos
+                    val lastSourceMessage = if (sessionId == null) lastSourceRequestNanos else lastKeepaliveNanos
+                    if (running && now - lastSourceMessage >= sourceDeadline) {
+                        finish("source control timeout")
+                    }
+                }
+            }
         } catch (e: Exception) {
             finish("control start failed: ${e.message ?: "unknown"}")
         }
@@ -93,6 +169,31 @@ class RtspSessionEngine(
 
     fun close(reason: String = "closed") {
         finish(reason)
+    }
+
+    /** Optional recovery: a rejected M13 must never end otherwise valid playback. */
+    fun requestIdr(): Boolean {
+        synchronized(this) {
+            if (!running || !playing || finishOnce.get()) return false
+            val now = nanoTime()
+            pending.entries.removeAll { it.value.optional && now - it.value.sentAtNanos >= 5_000_000_000L }
+            if (pending.values.any { it.optional } ||
+                (lastIdrRequestNanos != Long.MIN_VALUE && now - lastIdrRequestNanos < 1_000_000_000L)
+            ) return false
+            lastIdrRequestNanos = now
+            thread(name = "RTSP-IDR-$generation") {
+                synchronized(this) {
+                    if (!running || !playing) return@thread
+                    sendRequest(
+                        "SET_PARAMETER", presentationUrl,
+                        mapOf("Session" to sessionHeader()),
+                        "wfd_idr_request\r\n".toByteArray(StandardCharsets.UTF_8),
+                        optional = true,
+                    )
+                }
+            }
+            return true
+        }
     }
 
     private fun readLoop() {
@@ -116,9 +217,30 @@ class RtspSessionEngine(
     }
 
     private fun processRequest(message: RtspMessage) {
+        inboundRequestNanos = nanoTime()
         val method = message.startLine.substringBefore(' ').trim().uppercase()
-        val cseqValue = message.cseq()?.toString() ?: "0"
+        val cseqValue = message.cseq()?.toString() ?: run {
+            sendResponse("0", "400 Bad Request")
+            return
+        }
+        if (!message.startLine.endsWith(" RTSP/1.0")) {
+            sendResponse(cseqValue, "400 Bad Request")
+            return
+        }
+        // WFD v2.1 Appendix E.1 permits source requests, including M16,
+        // without Session. A supplied ID must still match the SETUP session.
+        if (sessionId != null &&
+            (method == "GET_PARAMETER" || method == "SET_PARAMETER") && message.header("session") != null &&
+            !sessionMatches(message)
+        ) {
+            sendResponse(cseqValue, "454 Session Not Found")
+            return
+        }
+        lastSourceRequestNanos = nanoTime()
         val body = RtspCodec.bodyText(message)
+        // M4/M14/M15 are source -> sink SET_PARAMETER transactions. Parse
+        // before replying, but commit only after the successful 200 response.
+        val pendingUibc = if (method == "SET_PARAMETER") stageUibc(body) else null
         if (method in setOf("OPTIONS", "SETUP", "PLAY", "PAUSE", "TEARDOWN")) {
             DebugEventLog.record(DebugEventCategory.RTSP, "RTSP request $method")
         } else {
@@ -133,48 +255,113 @@ class RtspSessionEngine(
                 }
             }
             "GET_PARAMETER" -> {
+                if (!optionsComplete) {
+                    sendResponse(cseqValue, "455 Method Not Valid in This State")
+                    return
+                }
+                if (body.isBlank()) {
+                    if (sessionId != null) lastKeepaliveNanos = nanoTime()
+                    val headers = sessionId?.let { mapOf("Session" to it) } ?: emptyMap()
+                    sendResponse(cseqValue, "200 OK", headers)
+                    return
+                }
+                val local = ensureMedia() ?: return
+                val capabilities = advertisedCapabilities
+                    ?: capabilitySnapshot(local.rtpPort).also { advertisedCapabilities = it }
                 learnProfile(body, message)
-                val response = WfdCapabilities.buildResponse(body, localEndpoint?.rtpPort)
+                val response = WfdCapabilities.buildResponse(body, localEndpoint?.rtpPort, advertisedCapabilities = capabilities)
                     .toByteArray(StandardCharsets.UTF_8)
-                sendResponse(cseqValue, "200 OK", body = response)
+                if (!sendResponse(cseqValue, "200 OK", body = response)) return
+                WfdSelection.mediaDiagnostics(response.decodeToString()).takeIf { it.isNotEmpty() }?.let {
+                    rtspMediaLog("M3 response written generation=$generation $it")
+                }
+                if (body.lineSequence().any { it.trim().equals("wfd_uibc_capability", true) }) {
+                    rtspUibcLogInfo("UIBC M3 capability response generation=$generation enabled=${response.decodeToString().contains("wfd_uibc_capability: input_category_list", true)}")
+                }
             }
             "SET_PARAMETER" -> {
-                learnProfile(body, message)
+                if (!optionsComplete || advertisedCapabilities == null) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=capabilities_not_advertised")
+                    sendResponse(cseqValue, "455 Method Not Valid in This State")
+                    return
+                }
+                if (pendingUibc?.capability?.valid == false || pendingUibc?.setting?.valid == false) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=invalid_uibc")
+                    sendResponse(cseqValue, "451 Parameter Not Understood")
+                    return
+                }
+                val uibcSelected = pendingUibc?.capability?.capabilities?.isNotEmpty() == true ||
+                    pendingUibc?.setting?.setting == UibcSetting.ENABLED
+                if (uibcSelected && parameter(advertisedCapabilities!!, "wfd_uibc_capability").let {
+                        it == null || it.equals("none", true)
+                    }
+                ) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=uibc_not_advertised")
+                    sendResponse(cseqValue, "451 Parameter Not Understood")
+                    return
+                }
+                // Profile selection is independent of optional UIBC state.
+                // Defer endpoint publication until this request is acknowledged.
+                learnProfile(body, message, publishUibc = false)
                 val validationError = validateSelected(body)
                 if (validationError != null) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=$validationError")
                     sendResponse(cseqValue, "451 Parameter Not Understood")
-                    finish(validationError)
                     return
                 }
-                sendResponse(cseqValue, "200 OK")
-                if (hasTrigger(body, "TEARDOWN")) {
-                    finish("source teardown trigger")
+                val trigger = parameter(body, "wfd_trigger_method")?.uppercase()
+                if (trigger != null && trigger !in setOf("SETUP", "PLAY", "PAUSE", "TEARDOWN")) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=unsupported_trigger")
+                    sendResponse(cseqValue, "451 Parameter Not Understood")
                     return
                 }
+                val selectedVideoUpdate = parameter(body, "wfd_video_formats")?.let { !it.equals("none", true) }
+                val selectedAudioUpdate = parameter(body, "wfd_audio_codecs")?.let { !it.equals("none", true) }
+                if ((trigger == "SETUP" && ((!selectedPresentation && presentationUrlToken(body) == null) ||
+                            (!(selectedVideoUpdate ?: selectedVideo) && !(selectedAudioUpdate ?: selectedAudio)) ||
+                            setupOnce.get())) ||
+                    (trigger in setOf("PLAY", "PAUSE", "TEARDOWN") &&
+                        (sessionId == null || pending.values.any { !it.optional }))
+                ) {
+                    rtspMediaLog("M4/SET_PARAMETER rejected generation=$generation reason=invalid_trigger_state")
+                    sendResponse(cseqValue, "455 Method Not Valid in This State")
+                    return
+                }
+                if (!sendResponse(cseqValue, "200 OK")) return
+                if (pendingUibc != null) {
+                    rtspUibcLogDebug("UIBC source SET_PARAMETER acknowledged generation=$generation")
+                    commitUibc(pendingUibc)
+                }
+                maybePublishUibcEndpoint()
                 updatePresentationUrl(body)
-                if (hasTrigger(body, "SETUP")) initiateSetup()
-            }
-            "SETUP" -> handleInboundSetup(cseqValue, message)
-            "PLAY" -> {
-                if (!sessionMatches(message)) {
-                    sendResponse(cseqValue, "454 Session Not Found")
-                } else {
-                    sendResponse(cseqValue, "200 OK", mapOf("Session" to sessionHeader()))
-                    invokeCallback("play") { callbacks.onPlay(generation) }
+                selectedVideoUpdate?.let { selectedVideo = it }
+                selectedAudioUpdate?.let { selectedAudio = it }
+                WfdSelection.mediaDiagnostics(body).takeIf { it.isNotEmpty() }?.let {
+                    val timing = WfdSelection.selectedCeaTiming(body)?.let { mode -> " selectedCEA=$mode" }.orEmpty()
+                    rtspMediaLog("M4 selection committed generation=$generation $it$timing")
+                }
+                when (trigger) {
+                    "SETUP" -> initiateSetup()
+                    "PLAY", "PAUSE", "TEARDOWN" ->
+                        sendRequest(trigger, presentationUrl, mapOf("Session" to sessionHeader()))
                 }
             }
-            "PAUSE" -> sendResponse(cseqValue, "200 OK", mapOf("Session" to sessionHeader()))
-            "TEARDOWN" -> {
-                sendResponse(cseqValue, "200 OK", mapOf("Session" to sessionHeader()))
-                finish("source teardown method")
-            }
+            // The source is the RTSP server, even when the sink is the P2P GO.
+            "SETUP", "PLAY", "PAUSE", "TEARDOWN" ->
+                sendResponse(cseqValue, "405 Method Not Allowed", mapOf("Allow" to "OPTIONS, GET_PARAMETER, SET_PARAMETER"))
             else -> sendResponse(cseqValue, "501 Not Implemented")
         }
     }
 
     private fun processResponse(message: RtspMessage) {
-        val number = message.cseq() ?: return
-        val method = pending.remove(number) ?: return
+        val number = message.cseq() ?: run {
+            finish("response missing valid CSeq")
+            return
+        }
+        // Unsolicited or late optional replies cannot advance another transaction.
+        val request = pending.remove(number) ?: return
+        val method = request.method
+        lastSourceRequestNanos = nanoTime()
         val statusCode = message.startLine.split(' ', limit = 3).getOrNull(1)?.toIntOrNull() ?: 0
         val success = statusCode in 200..299
         DebugEventLog.record(
@@ -182,12 +369,29 @@ class RtspSessionEngine(
             "RTSP response $method status=$statusCode",
         )
         if (!success) {
+            if (request.optional) {
+                DebugEventLog.recordRateLimited(DebugEventCategory.MEDIA, "optional-rejected-$generation", "Source rejected optional ${request.method} status=$statusCode")
+                return
+            }
             finish("$method rejected: ${message.startLine}")
             return
         }
+        // Appendix E.1 also shows M7 success without a Session echo. CSeq
+        // already binds this response to a request on this control connection;
+        // only SETUP creates the session, and a supplied ID cannot replace it.
+        val responseSession = message.sessionId()
+        if (sessionId != null && method != "OPTIONS" &&
+            message.header("session") != null && responseSession != sessionId
+        ) {
+            if (request.optional) return
+            val detail = if (responseSession == null) "empty Session header" else "different Session ID"
+            finish("$method response Session mismatch (CSeq=$number, $detail)")
+            return
+        }
         when (method) {
+            "OPTIONS" -> optionsComplete = true
             "SETUP" -> {
-                val negotiatedSession = message.sessionId()
+                val negotiatedSession = responseSession
                     ?: run {
                         finish("SETUP response missing Session header")
                         return
@@ -198,6 +402,25 @@ class RtspSessionEngine(
                     finish("SETUP response arrived before local transport")
                     return
                 }
+                if (transport == null || !transport.profile.equals("RTP/AVP/UDP", true) ||
+                    !transport.unicast || transport.parameters.containsKey("multicast") ||
+                    transport.parameters.containsKey("interleaved") ||
+                    transport.clientRtpPort != local.rtpPort ||
+                    transport.clientRtcpPort != local.rtcpPort ||
+                    transport.serverRtpPort == null ||
+                    local.rtcpPort != null && transport.serverRtcpPort == null
+                ) {
+                    finish("SETUP response Transport mismatch or unsupported transport")
+                    return
+                }
+                message.header("session")?.split(';')?.drop(1)?.forEach { token ->
+                    if (token.trim().startsWith("timeout=", true)) {
+                        token.substringAfter('=').trim().toLongOrNull()?.takeIf { it in 1..86400 }
+                            ?.let { sourceTimeoutNanos = it.coerceAtLeast(10) * 1_000_000_000L }
+                    }
+                }
+                lastSourceRequestNanos = nanoTime()
+                lastKeepaliveNanos = lastSourceRequestNanos
                 val negotiated = NegotiatedTransport(
                     sessionId = sessionId,
                     local = local,
@@ -214,64 +437,32 @@ class RtspSessionEngine(
                 sendRequest("PLAY", presentationUrl, mapOf("Session" to sessionHeader()))
             }
             "PLAY" -> {
+                if (!request.optional) {
+                    playing = true
+                    if (!invokeCallback("play") { callbacks.onPlay(generation) }) return
+                }
                 if (profile.secondPlay && !secondPlaySent) {
                     secondPlaySent = true
                     delay(profile.secondPlayDelayMs)
-                    sendRequest("PLAY", presentationUrl, mapOf("Session" to sessionHeader()))
-                } else {
-                    invokeCallback("play") { callbacks.onPlay(generation) }
+                    sendRequest("PLAY", presentationUrl, mapOf("Session" to sessionHeader()), optional = true)
                 }
             }
+            "PAUSE" -> playing = false
+            "TEARDOWN" -> finish("source teardown completed")
         }
     }
 
-    private fun handleInboundSetup(cseqValue: String, message: RtspMessage) {
-        if (!inboundSetupOnce.compareAndSet(false, true)) {
-            sendResponse(cseqValue, "455 Method Not Valid in This State", mapOf("Session" to sessionHeader()))
-            return
-        }
-        DebugEventLog.record(DebugEventCategory.RTSP, "RTSP inbound SETUP accepted")
-        val local = ensureMedia() ?: return
-        sessionId = sessionId ?: generatedSession()
-        val requestTransport = message.header("transport")?.let(RtspTransport::parse)
-        val remoteRtp = requestTransport?.clientRtpPort
-        val remoteRtcp = requestTransport?.clientRtcpPort
-        val negotiated = NegotiatedTransport(
-            sessionId = sessionId,
-            local = local,
-            remoteRtpPort = remoteRtp,
-            remoteRtcpPort = remoteRtcp,
-            ssrc = requestTransport?.ssrc,
-            rtcpFeedbackSsrc = requestTransport?.rtcpFeedbackSsrc,
-            parameters = requestTransport?.parameters ?: emptyMap(),
-        )
-        if (!invokeCallback("transport ready") {
-                callbacks.onTransportReady(generation, negotiated)
-            }) return
-        DebugEventLog.record(
-            DebugEventCategory.RTSP,
-            "RTSP transport negotiated RTP=${local.rtpPort} remoteRTP=${remoteRtp ?: "unknown"}",
-        )
-        val clientPorts = if (remoteRtp != null && remoteRtcp != null) ";client_port=$remoteRtp-$remoteRtcp" else ""
-        sendResponse(
-            cseqValue,
-            "200 OK",
-            mapOf(
-                "Session" to sessionHeader(),
-                "Transport" to "RTP/AVP/UDP;unicast$clientPorts;server_port=${local.rtpPort}-${local.rtcpPort ?: local.rtpPort}",
-            ),
-        )
-    }
 
     private fun initiateSetup() {
         if (!setupOnce.compareAndSet(false, true)) return
         val local = ensureMedia() ?: return
         DebugEventLog.record(DebugEventCategory.RTSP, "RTSP sending SETUP localRTP=${local.rtpPort}")
         delay(profile.setupDelayMs)
+        val ports = if (local.rtcpPort == null) "${local.rtpPort}" else "${local.rtpPort}-${local.rtcpPort}"
         sendRequest(
             "SETUP",
             presentationUrl,
-            mapOf("Transport" to "RTP/AVP/UDP;unicast;client_port=${local.rtpPort}-${local.rtcpPort ?: local.rtpPort}"),
+            mapOf("Transport" to "RTP/AVP/UDP;unicast;client_port=$ports"),
         )
     }
 
@@ -312,13 +503,127 @@ class RtspSessionEngine(
     private fun failureMessage(t: Throwable): String =
         t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
 
-    private fun learnProfile(body: String, message: RtspMessage) {
+    private fun stageUibc(body: String): PendingUibcUpdate? {
+        if (body.isBlank()) return null
+        val capability = UibcCapabilityParser.parseBody(body).takeIf { it.advertised }
+        val setting = UibcCapabilityParser.parseSettingBody(body).takeIf { it.present }
+        return PendingUibcUpdate(capability, setting).takeIf { it.present }
+    }
+
+    /**
+     * Apply source UIBC capability/port/setting state after its SET_PARAMETER
+     * transaction has received a successful response. This keeps endpoint
+     * publication and disable notifications out of the pre-200 path.
+     */
+    private fun commitUibc(update: PendingUibcUpdate) {
+        update.capability?.let { capability ->
+            if (!capability.valid) {
+                clearUibc(capability.error ?: "unsupported capability")
+            } else if (capability.capabilities.isEmpty()) {
+                clearUibc("source advertised no supported UIBC touch capability")
+            } else {
+                val changed = uibcCapabilities != capability.capabilities || uibcPort != capability.port ||
+                    uibcCategory != capability.category || uibcPath != capability.path || uibcHidType != capability.hidType
+                if (changed) {
+                    val wasPublished = uibcEndpointPublished
+                    uibcCapabilities = capability.capabilities
+                    uibcPort = capability.port
+                    uibcCategory = capability.category
+                    uibcPath = capability.path
+                    uibcHidType = capability.hidType
+                    uibcEndpointPublished = false
+                    if (wasPublished) {
+                        notifyUibcDisabled(if (capability.port == null) "source UIBC port withdrawn" else "source UIBC endpoint changed")
+                    }
+                }
+                DebugEventLog.record(DebugEventCategory.UIBC, "UIBC capability committed port=${capability.port}")
+                rtspUibcLogInfo("UIBC capability committed generation=$generation category=${capability.category} path=${capability.path} type=${capability.hidType} port=${capability.port} capabilities=${capability.capabilities}")
+            }
+        }
+        update.setting?.let { setting ->
+            if (!setting.valid) {
+                uibcSetting = UibcSetting.DISABLED
+                rtspUibcLogWarn("UIBC setting rejected generation=$generation: ${setting.error}")
+                disableUibc(setting.error ?: "unsupported setting")
+            } else {
+                uibcSetting = setting.setting
+                rtspUibcLogInfo("UIBC setting committed generation=$generation value=${setting.setting}")
+                if (setting.setting == UibcSetting.DISABLED) {
+                    disableUibc("source disabled UIBC")
+                }
+            }
+        }
+    }
+
+    private fun clearUibc(reason: String) {
+        val hadState = uibcCapabilities.isNotEmpty() || uibcPort != null || uibcEndpointPublished
+        uibcCapabilities = emptySet()
+        uibcPort = null
+        uibcEndpointPublished = false
+        rtspUibcLogWarn("UIBC capability cleared generation=$generation: $reason")
+        if (hadState) notifyUibcDisabled(reason)
+    }
+
+    private fun disableUibc(reason: String) {
+        val wasPublished = uibcEndpointPublished
+        uibcEndpointPublished = false
+        rtspUibcLogInfo("UIBC disabled generation=$generation: $reason")
+        if (wasPublished) notifyUibcDisabled(reason)
+    }
+
+    private fun notifyUibcDisabled(reason: String) {
+        try {
+            callbacks.onUibcDisabled(generation, reason)
+        } catch (t: Throwable) {
+            // UIBC is optional. A failing UIBC callback must not tear down RTP.
+            rtspUibcLogWarn("UIBC disable callback failed generation=$generation: ${failureMessage(t)}")
+        }
+    }
+
+    private fun notifyUibcEndpoint(endpoint: UibcEndpoint): Boolean {
+        return try {
+            callbacks.onUibcEndpoint(generation, endpoint)
+            true
+        } catch (t: Throwable) {
+            // UIBC is optional. A failing endpoint callback must not tear down RTSP/RTP.
+            rtspUibcLogWarn("UIBC endpoint callback failed generation=$generation: ${failureMessage(t)}")
+            notifyUibcDisabled("endpoint callback failed")
+            false
+        }
+    }
+
+    private fun maybePublishUibcEndpoint() {
+        val port = uibcPort ?: run {
+            if (uibcSetting == UibcSetting.ENABLED) {
+                rtspUibcLogDebug("UIBC waiting for source port generation=$generation")
+            }
+            return
+        }
+        if (uibcCapabilities.isEmpty() || uibcEndpointPublished) return
+        val enabled = uibcSetting == UibcSetting.ENABLED
+        if (!enabled) {
+            rtspUibcLogDebug("UIBC capability held disabled generation=$generation setting=$uibcSetting profile=${profile.sourceKind}")
+            return
+        }
+        val endpoint = try {
+            UibcEndpoint(sourceIp, port, uibcCapabilities, generation, uibcCategory, uibcPath, uibcHidType)
+        } catch (e: IllegalArgumentException) {
+            notifyUibcDisabled(e.message ?: "invalid endpoint")
+            return
+        }
+        if (notifyUibcEndpoint(endpoint)) {
+            uibcEndpointPublished = true
+            DebugEventLog.record(DebugEventCategory.UIBC, "UIBC endpoint published port=$port")
+            rtspUibcLogInfo("UIBC endpoint published generation=$generation source=$sourceIp port=$port")
+        }
+    }
+
+    private fun learnProfile(body: String, message: RtspMessage, publishUibc: Boolean = true) {
         val names = body.lineSequence()
             .map { it.substringBefore(':').trim() }
             .filter { it.isNotEmpty() }
             .toSet()
         val evidence = SourceEvidence(
-            role = if (entry == RtspEntry.Outbound) P2pRole.SinkClientSourceGo else P2pRole.SinkGoSourceClient,
             entry = entry,
             firstMethod = message.startLine.substringBefore(' ').uppercase(),
             server = message.header("server"),
@@ -332,54 +637,39 @@ class RtspSessionEngine(
         if (selected.sourceKind != SourceKind.Unknown &&
             (selected.sourceKind != profile.sourceKind || selected.entry != profile.entry)
         ) {
-            profile = selected
+            profile = selected.copy(secondPlay = profile.secondPlay)
             DebugEventLog.record(DebugEventCategory.WFD, "WFD source profile detected ${profile.sourceKind}")
+            rtspUibcLogInfo("WFD source profile detected generation=$generation kind=${profile.sourceKind}")
             invokeCallback("profile") { callbacks.onProfile(generation, profile) }
         }
+        if (publishUibc) maybePublishUibcEndpoint()
     }
 
     private fun validateSelected(body: String): String? {
         val selectedUrl = presentationUrlToken(body)
-        if (!selectedUrl.isNullOrBlank() && !selectedUrl.equals("none", true)) {
-            val uri = try { java.net.URI(selectedUrl) } catch (_: Exception) { null }
-                ?: return "invalid presentation URL"
-            val host = uri.host ?: return "presentation URL has no host"
-            if (!uri.scheme.equals("rtsp", true)) return "presentation URL must use rtsp"
-            // The RTSP connection is already established to sourceIp. Android
-            // sources commonly append "none" to this parameter and may report
-            // a group/interface address that differs from the connected peer.
-            // Keep syntax validation, but do not redirect or reject Android's
-            // already-connected socket based on the URL host.
-            if (profile.sourceKind != SourceKind.Android &&
-                host != sourceIp && host != "255.255.255.255"
-            ) return "presentation URL host mismatch"
+        if (parameter(body, "wfd_presentation_URL") != null) {
+            if (selectedUrl.isNullOrBlank() || selectedUrl.equals("none", true)) return "missing presentation URL"
+            val urls = parameter(body, "wfd_presentation_URL")!!.split(Regex("\\s+"))
+            if (urls.size > 2) return "invalid presentation URL list"
+            for (url in urls.filterNot { it.equals("none", true) }) {
+                val uri = try { java.net.URI(url) } catch (_: Exception) { null }
+                    ?: return "invalid presentation URL"
+                if (!uri.scheme.equals("rtsp", true) || uri.host.isNullOrBlank() ||
+                    uri.userInfo != null || uri.fragment != null || uri.port !in -1..65535 ||
+                    uri.port == 0
+                ) return "invalid presentation URL"
+            }
         }
-        val video = parameter(body, "wfd_video_formats")
-        if (!video.isNullOrBlank() && !video.equals("none", true)) {
-            val first = video.trim().split(Regex("\\s+")).firstOrNull()
-            if (first.isNullOrBlank() || !first.matches(Regex("[0-9A-Fa-f]+"))) return "unsupported video format"
-        }
-        val audio = parameter(body, "wfd_audio_codecs")
-        if (!audio.isNullOrBlank() && !audio.equals("none", true) && !audio.startsWith("LPCM", true)) {
-            return "unsupported audio codec"
-        }
-        val ports = Regex("(?i)(?:client_port|server_port)\\s*=\\s*(\\d+)(?:\\s*-\\s*|\\s+)(\\d+)")
-        for (match in ports.findAll(body)) {
-            val first = match.groupValues[1].toIntOrNull()
-            val second = match.groupValues[2].toIntOrNull()
-            if (first == null || second == null || first !in 1..65535 || second !in 1..65535) return "invalid RTP/RTCP ports"
-        }
-        return null
+        val capabilities = advertisedCapabilities ?: return "capabilities have not been advertised"
+        return WfdCapabilities.validateSelection(body, capabilities)
     }
 
-    /** Android's WFD grammar emits the URL followed by a `none` capability token. */
+    /** Primary and optional secondary URL tokens are distinct from the URI. */
     private fun presentationUrlToken(body: String): String? =
         parameter(body, "wfd_presentation_URL")
             ?.trim()
-            ?.let { raw ->
-                val parts = raw.split(Regex("\\s+"), limit = 2)
-                if (parts.size == 2 && !parts[1].equals("none", true)) raw else parts[0]
-            }
+            ?.split(Regex("\\s+"))
+            ?.firstOrNull()
             ?.takeIf { it.isNotEmpty() }
 
     private fun updatePresentationUrl(body: String) {
@@ -387,6 +677,7 @@ class RtspSessionEngine(
             ?.takeUnless { it.equals("none", true) || it.isBlank() }
             ?: return
         presentationUrl = if (profile.normalizeBroadcastUrl) selected.replace("255.255.255.255", sourceIp) else selected
+        selectedPresentation = true
     }
 
     private fun parameter(body: String, name: String): String? = body.lineSequence()
@@ -394,45 +685,53 @@ class RtspSessionEngine(
         ?.substringAfter(':', "")
         ?.trim()
 
-    private fun hasTrigger(body: String, trigger: String): Boolean =
-        body.lineSequence().any { it.trim().equals("wfd_trigger_method: $trigger", true) }
 
     private fun sessionMatches(message: RtspMessage): Boolean =
-        message.sessionId()?.let { sessionId == null || it == sessionId } != false
+        sessionId != null && message.sessionId() == sessionId
 
-    private fun generatedSession(): String = "${generation.toString(16)}-${System.currentTimeMillis().toString(16)}"
-
-    private fun sessionHeader(): String = sessionId ?: generatedSession().also { sessionId = it }
+    private fun sessionHeader(): String = checkNotNull(sessionId) { "RTSP Session not negotiated" }
 
     private fun publicHeader(): String = "org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER"
 
-    private fun sendResponse(cseqValue: String, status: String, headers: Map<String, String> = emptyMap(), body: ByteArray = ByteArray(0)) {
+    private fun sendResponse(cseqValue: String, status: String, headers: Map<String, String> = emptyMap(), body: ByteArray = ByteArray(0)): Boolean {
         val all = LinkedHashMap<String, String>()
         all["CSeq"] = cseqValue
         all.putAll(headers)
         if (body.isNotEmpty()) all["Content-Type"] = "text/parameters"
-        write(RtspCodec.encode("RTSP/1.0 $status", all, body))
+        val sent = write(RtspCodec.encode("RTSP/1.0 $status", all, body))
+        inboundRequestNanos = Long.MIN_VALUE
+        return sent
     }
 
-    private fun sendRequest(method: String, url: String, headers: Map<String, String> = emptyMap()): Int {
+    private fun sendRequest(
+        method: String,
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        body: ByteArray = ByteArray(0),
+        optional: Boolean = false,
+    ): Int = synchronized(this) {
         val number = cseq.getAndIncrement()
-        pending[number] = method
+        pending[number] = PendingRequest(method, optional, nanoTime())
         val all = LinkedHashMap<String, String>()
         all["CSeq"] = number.toString()
         all["User-Agent"] = "MiracastSink"
+        if (body.isNotEmpty()) all["Content-Type"] = "text/parameters"
         all.putAll(headers)
-        write(RtspCodec.encode("$method $url RTSP/1.0", all))
-        return number
+        if (!write(RtspCodec.encode("$method $url RTSP/1.0", all, body))) pending.remove(number)
+        number
     }
 
-    private fun write(bytes: ByteArray) {
-        try {
+    private fun write(bytes: ByteArray): Boolean {
+        return try {
             synchronized(this) {
-                output?.write(bytes)
-                output?.flush()
+                val stream = output ?: throw IllegalStateException("RTSP output is unavailable")
+                stream.write(bytes)
+                stream.flush()
             }
+            true
         } catch (e: Exception) {
             if (running) finish("control write failed: ${e.message ?: "unknown"}")
+            false
         }
     }
 
@@ -444,8 +743,10 @@ class RtspSessionEngine(
     private fun finish(reason: String) {
         if (!finishOnce.compareAndSet(false, true)) return
         running = false
+        playing = false
         DebugEventLog.record(DebugEventCategory.RTSP, "RTSP session finishing: $reason")
         pending.clear()
+        if (uibcEndpointPublished) disableUibc("RTSP session ended")
         try { socket.close() } catch (_: Exception) {}
         try {
             callbacks.onSessionEnded(generation, reason)

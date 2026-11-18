@@ -12,8 +12,22 @@ android {
         applicationId = "foxlost.miracast.sink"
         minSdk = 29
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.4"
+        versionCode = 23
+        versionName = "1.22"
+    }
+
+    // AGP resolves the SDK's side-by-side NDK (or local.properties ndk.dir).
+    ndkVersion = "29.0.14206865"
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/cpp/Android.mk")
+        }
+    }
+    packaging {
+        jniLibs {
+            // Required for explicit app_process loading from APK !/lib/<ABI>/...
+            useLegacyPackaging = false
+        }
     }
 
     buildTypes {
@@ -42,15 +56,13 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     
     // Compose
-    val composeBom = platform("androidx.compose:compose-bom:2024.01.00")
+    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.activity:activity-compose:1.8.2")
 
-    // LSPosed API
-    compileOnly("de.robv.android.xposed:api:82")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
     testImplementation("junit:junit:4.13.2")
 }

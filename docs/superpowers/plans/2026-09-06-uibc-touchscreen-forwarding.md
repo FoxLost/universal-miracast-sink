@@ -3,7 +3,14 @@
 **Date:** 2026-09-06  
 **Design:** `docs/superpowers/specs/2026-09-06-uibc-touchscreen-forwarding-design.md`  
 **Target branch:** `feature/uibc-touchscreen-forwarding`  
-**Scope:** Implementation plan only. Do not change P2P/GO negotiation, RTSP `Public`, RTP media transport, or Android input-injection behavior.
+**Scope:** Historical original Generic-only implementation plan. The REA-driven implementation revision below supersedes its original HIDC/media exclusions.
+
+**Implementation revision:** Generic and HIDC USB touch, gesture/queue lifecycle
+fixes, RTP reordering/IDR recovery, LPCM PTS, and shared playback timing are now
+implemented. JVM regression coverage and actual TCP/UDP loopback smoke scenarios
+exercise the software paths. The original phases/checklist below remain a record
+of the first plan; physical Windows/Android input, codec/audio presentation, and
+vendor-platform acceptance must not be marked verified without device evidence.
 
 ## Implementation invariants
 
