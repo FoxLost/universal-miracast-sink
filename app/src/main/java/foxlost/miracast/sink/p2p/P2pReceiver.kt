@@ -5,7 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.net.wifi.p2p.WifiP2pManager
 
-class P2pReceiver(private val p2pManager: P2pManager) : BroadcastReceiver() {
+class P2pReceiver(
+    private val p2pManager: P2pManager,
+    private val allowVendorAuthorization: Boolean = false,
+) : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             // Framework's authoritative group/network transition. Some
@@ -43,8 +46,10 @@ class P2pReceiver(private val p2pManager: P2pManager) : BroadcastReceiver() {
             // fallback for builds that expose the headless authorization hook.
             "android.net.wifi.p2p.CONNECTION_REQUEST_ACCEPT",
             "android.net.wifi.p2p.CONNECTION_REQUEST" -> {
-                android.util.Log.i("MiracastP2P", "Incoming connection request — auto-accepting")
-                p2pManager.autoAcceptConnection()
+                if (allowVendorAuthorization) {
+                    android.util.Log.i("MiracastP2P", "Incoming connection request — auto-accepting")
+                    p2pManager.autoAcceptConnection()
+                }
             }
         }
     }

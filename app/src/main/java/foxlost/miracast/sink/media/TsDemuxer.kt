@@ -1,16 +1,21 @@
 package foxlost.miracast.sink.media
 
-import android.util.Log
+import foxlost.miracast.sink.DebugEventCategory
+import foxlost.miracast.sink.DebugEventLog
 import java.io.ByteArrayOutputStream
 
 /** MPEG-TS demuxer for complete or fragmented RTP payloads. */
 class TsDemuxer(
     private val onVideoNaluExtracted: (nalu: ByteArray, ptsUs: Long) -> Unit,
-    private val onAudioFrameExtracted: (pcmData: ByteArray, sampleRate: Int, channels: Int) -> Unit,
+    private val onAudioFrameExtracted: (pcmData: ByteArray, sampleRate: Int, channels: Int, ptsUs: Long) -> Unit,
+    // Requests video reference recovery, not a global A/V reset. Known audio/PSI
+    // transport loss never invokes this; explicit discontinuity() is caller-owned.
+    private val onDiscontinuity: (() -> Unit)? = null,
 ) {
     private var videoPid = -1
     private var audioPid = -1
     private var pmtPid = -1
+    private var hasProgramMap = false
     private val videoPesBuffer = ByteArrayOutputStream(256 * 1024)
     private var currentVideoPtsUs = 0L
     private val audioPesBuffer = ByteArrayOutputStream(256 * 1024)
@@ -19,6 +24,40 @@ class TsDemuxer(
     private val patSection = ByteArrayOutputStream(1024)
     private val pmtSection = ByteArrayOutputStream(1024)
     private val continuity = HashMap<Int, Int>()
+    private var videoActive = false
+    private var audioActive = false
+    private var awaitingIdr = false
+    private var videoRemaining = -1
+    private var audioRemaining = -1
+
+    /** A known PID loss must not invalidate another elementary stream. */
+    private fun discardPid(pid: Int) {
+        continuity.remove(pid)
+        when (pid) {
+            0 -> patSection.reset()
+            pmtPid -> pmtSection.reset()
+            videoPid -> {
+                videoPesBuffer.reset()
+                videoActive = false
+                videoRemaining = -1
+                awaitingIdr = true
+                onDiscontinuity?.invoke()
+            }
+            audioPid -> {
+                audioPesBuffer.reset()
+                audioActive = false
+                audioRemaining = -1
+            }
+        }
+    }
+
+    /** Discard partial transport/PES state; never concatenate across a lost datagram. */
+    fun discontinuity() {
+        carry.reset(); patSection.reset(); pmtSection.reset()
+        videoPesBuffer.reset(); audioPesBuffer.reset(); continuity.clear()
+        videoActive = false; audioActive = false
+        videoRemaining = -1; audioRemaining = -1; awaitingIdr = true
+    }
 
     /** Accepts an arbitrary slice; an RTP payload may end in the middle of a TS packet. */
     fun processRtpPayload(payload: ByteArray, offset: Int, length: Int) {
@@ -35,7 +74,7 @@ class TsDemuxer(
             if (carry.size() == 188) {
                 val packet = carry.toByteArray()
                 if (packet[0] == 0x47.toByte()) parseTsPacket(packet, 0)
-                else Log.w(TAG, "Discarding TS carry-over without sync")
+                else DebugEventLog.recordRateLimited(DebugEventCategory.MEDIA, "ts-sync", "Discarding TS carry-over without sync")
                 carry.reset()
                 startedPacket = true
             }
@@ -72,72 +111,70 @@ class TsDemuxer(
         val b3 = packet[offset + 3].toInt() and 0xff
         val payloadStart = (b1 and 0x40) != 0
         val pid = ((b1 and 0x1f) shl 8) or b2
+        // Null packets have no continuity semantics, including their TEI/flags.
+        if (pid == 0x1fff) return
         val adaptationControl = (b3 ushr 4) and 0x03
         val counter = b3 and 0x0f
         if (adaptationControl == 0) return
         val hasPayload = adaptationControl == 1 || adaptationControl == 3
-        val previous = continuity[pid]
-        if (hasPayload && previous != null && ((previous + 1) and 0x0f) != counter) {
-            Log.w(TAG, "TS continuity gap pid=$pid expected=${(previous + 1) and 0xf} got=$counter")
-            if (pid == 0) patSection.reset()
-            if (pid == pmtPid) pmtSection.reset()
-            if (pid == videoPid) videoPesBuffer.reset()
-            if (pid == audioPid) audioPesBuffer.reset()
-        }
         var payloadOffset = offset + 4
+        var signaledDiscontinuity = false
         if (adaptationControl == 2 || adaptationControl == 3) {
-            if (payloadOffset >= offset + 188) return
             val adaptationLength = packet[payloadOffset].toInt() and 0xff
-            if (adaptationLength > offset + 188 - payloadOffset - 1) return
+            if (adaptationLength > offset + 188 - payloadOffset - 1) {
+                discardPid(pid)
+                return
+            }
+            signaledDiscontinuity = adaptationLength > 0 && packet[payloadOffset + 1].toInt() and 0x80 != 0
             payloadOffset += 1 + adaptationLength
         }
-        if (!hasPayload || payloadOffset >= offset + 188) return
         val payloadLength = offset + 188 - payloadOffset
+        // Discover fallback streams before tracking their first payload counter.
+        if (!hasProgramMap && hasPayload && payloadStart && b1 and 0x80 == 0 && isPesHeader(packet, payloadOffset, payloadLength)) {
+            val streamId = packet[payloadOffset + 3].toInt() and 0xff
+            if (pid != 0 && pid != pmtPid && pid != 4096) {
+                if (videoPid == -1 && streamId in 0xe0..0xef) videoPid = pid
+                if (audioPid == -1 && pid != videoPid && (streamId in 0xc0..0xdf || streamId == 0xbd)) audioPid = pid
+            }
+        }
+        if (pid != 0 && pid != pmtPid && pid != videoPid && pid != audioPid) return
+        if (b1 and 0x80 != 0) { discardPid(pid); return }
+        if (signaledDiscontinuity) discardPid(pid)
+        if (!hasPayload || payloadLength <= 0) return
+        val previous = continuity[pid]
+        if (previous != null && previous == counter) return
+        if (previous != null && ((previous + 1) and 0x0f) != counter) {
+            DebugEventLog.recordRateLimited(DebugEventCategory.MEDIA, "ts-continuity", "TS continuity gap pid=$pid expected=${(previous + 1) and 0xf} got=$counter")
+            discardPid(pid)
+        }
         // Adaptation-only packets do not advance the payload continuity state.
-        if (hasPayload) continuity[pid] = counter
+        continuity[pid] = counter
         when {
-            pid == 0 && isPsiStart(packet, payloadOffset, payloadLength, payloadStart, 0x00) -> {
+            pid == 0 && (payloadStart || patSection.size() > 0) -> {
                 consumePsi(pid, packet, payloadOffset, payloadLength, payloadStart); return
             }
-            pmtPid >= 0 && pid == pmtPid && isPsiStart(packet, payloadOffset, payloadLength, payloadStart, 0x02) -> {
+            pmtPid >= 0 && pid == pmtPid && (payloadStart || pmtSection.size() > 0) -> {
                 consumePsi(pid, packet, payloadOffset, payloadLength, payloadStart); return
             }
-            pid == 0 && !payloadStart && patSection.size() > 0 -> {
-                consumePsi(pid, packet, payloadOffset, payloadLength, false); return
-            }
-            pmtPid >= 0 && pid == pmtPid && !payloadStart && pmtSection.size() > 0 -> {
-                consumePsi(pid, packet, payloadOffset, payloadLength, false); return
-            }
-        }
-        if (videoPid == -1 && pid != 0 && pid != 4096 && isPesHeader(packet, payloadOffset, payloadLength)) {
-            val streamId = packet[payloadOffset + 3].toInt() and 0xff
-            if (streamId in 0xe0..0xef) videoPid = pid
-
-        }
-        if (audioPid == -1 && pid != 0 && pid != 4096 && pid != videoPid && isPesHeader(packet, payloadOffset, payloadLength)) {
-            val streamId = packet[payloadOffset + 3].toInt() and 0xff
-            if (streamId in 0xc0..0xdf || streamId == 0xbd) audioPid = pid
         }
         when {
-            pid == videoPid || (videoPid == -1 && isVideoStreamId(packet, payloadOffset, payloadLength)) -> {
-                if (payloadStart) { flushVideoPesBuffer(); parsePesHeaderAndExtractPts(packet, payloadOffset, payloadLength) }
-                else appendBounded(videoPesBuffer, packet, payloadOffset, payloadLength)
+            pid == videoPid -> {
+                if (payloadStart) {
+                    if (videoRemaining > 0) discardPid(videoPid) else flushVideoPesBuffer()
+                    continuity[pid] = counter
+                    parsePesHeaderAndExtractPts(packet, payloadOffset, payloadLength)
+                }
+                else if (videoActive) appendVideo(packet, payloadOffset, payloadLength)
             }
             pid == audioPid -> {
-                if (payloadStart) { flushAudioPesBuffer(); parseAudioPesHeader(packet, payloadOffset, payloadLength) }
-                else appendBounded(audioPesBuffer, packet, payloadOffset, payloadLength)
+                if (payloadStart) {
+                    if (audioRemaining > 0) discardPid(audioPid) else flushAudioPesBuffer()
+                    continuity[pid] = counter
+                    parseAudioPesHeader(packet, payloadOffset, payloadLength)
+                }
+                else if (audioActive) appendAudio(packet, payloadOffset, payloadLength)
             }
         }
-    }
-    private fun isPsiStart(packet: ByteArray, offset: Int, length: Int, pusi: Boolean, tableId: Int): Boolean {
-        if (!pusi || length < 4) return false
-        val pointer = packet[offset].toInt() and 0xff
-        if (pointer + 4 > length) return false
-        val sectionOffset = offset + 1 + pointer
-        if ((packet[sectionOffset].toInt() and 0xff) != tableId) return false
-        val sectionLength = ((packet[sectionOffset + 1].toInt() and 0x0f) shl 8) or
-            (packet[sectionOffset + 2].toInt() and 0xff)
-        return sectionLength >= 9
     }
 
 
@@ -151,8 +188,7 @@ class TsDemuxer(
             start++; remaining--
             if (pointer > remaining) { section.reset(); return }
             if (pointer > 0) {
-                section.write(packet, start, pointer)
-                parseCompletedPsi(pid, section)
+                if (section.size() > 0) consumePsi(pid, packet, start, pointer, false)
                 section.reset()
                 start += pointer; remaining -= pointer
             } else {
@@ -194,7 +230,14 @@ class TsDemuxer(
         while (q + 4 <= sectionEnd) {
             val program = ((section[q].toInt() and 0xff) shl 8) or (section[q + 1].toInt() and 0xff)
             val pid = ((section[q + 2].toInt() and 0x1f) shl 8) or (section[q + 3].toInt() and 0xff)
-            if (program != 0 && pid != 0) { pmtPid = pid; Log.d(TAG, "PAT: PMT PID=$pid") ; break }
+            if (program != 0 && pid != 0) {
+                if (pmtPid != pid) {
+                    continuity.remove(pmtPid)
+                    pmtSection.reset()
+                    pmtPid = pid
+                }
+                break
+            }
             q += 4
         }
     }
@@ -204,43 +247,66 @@ class TsDemuxer(
         val sectionEnd = section.size - 4
         val programInfoLength = ((section[10].toInt() and 0x0f) shl 8) or (section[11].toInt() and 0xff)
         var q = 12 + programInfoLength
+        if (q > sectionEnd) return
+        var nextVideoPid = -1
+        var nextAudioPid = -1
         while (q + 5 <= sectionEnd) {
             val streamType = section[q].toInt() and 0xff
             val elemPid = ((section[q + 1].toInt() and 0x1f) shl 8) or (section[q + 2].toInt() and 0xff)
             val infoLength = ((section[q + 3].toInt() and 0x0f) shl 8) or (section[q + 4].toInt() and 0xff)
             if (q + 5 + infoLength > sectionEnd) return
             when (streamType) {
-                0x1b -> videoPid = elemPid // Do not label HEVC (0x24) as H.264.
-                0x03, 0x04, 0x0f, 0x81, 0x83, 0x84 -> if (audioPid < 0) audioPid = elemPid
+                0x1b -> if (nextVideoPid < 0) nextVideoPid = elemPid // H.264, not HEVC.
+                0x83 -> if (nextAudioPid < 0) nextAudioPid = elemPid // WFD LPCM only.
             }
             q += 5 + infoLength
         }
+        if (q != sectionEnd) return
+        if (videoPid != nextVideoPid) {
+            if (videoPid >= 0) discardPid(videoPid)
+            continuity.remove(nextVideoPid)
+            videoPid = nextVideoPid
+        }
+        if (audioPid != nextAudioPid) {
+            if (audioPid >= 0) discardPid(audioPid)
+            continuity.remove(nextAudioPid)
+            audioPid = nextAudioPid
+        }
+        hasProgramMap = true
     }
 
     private fun isPesHeader(packet: ByteArray, offset: Int, length: Int): Boolean =
         length >= 6 && packet[offset] == 0.toByte() && packet[offset + 1] == 0.toByte() && packet[offset + 2] == 1.toByte()
 
-    private fun isVideoStreamId(packet: ByteArray, offset: Int, length: Int): Boolean =
-        isPesHeader(packet, offset, length) && (packet[offset + 3].toInt() and 0xff) in 0xe0..0xef
 
     private fun parsePesHeaderAndExtractPts(packet: ByteArray, offset: Int, length: Int) {
-        if (!isPesHeader(packet, offset, length) || length < 9) { appendBounded(videoPesBuffer, packet, offset, length); return }
+        videoActive = false
+        if (!isPesHeader(packet, offset, length) || length < 9) return
         val flags = packet[offset + 7].toInt() and 0xff
         val headerDataLength = packet[offset + 8].toInt() and 0xff
         if (headerDataLength > length - 9) { videoPesBuffer.reset(); return }
         if (((flags ushr 6) and 3) >= 2 && headerDataLength >= 5) currentVideoPtsUs = ptsUs(packet, offset + 9)
         val bodyOffset = offset + 9 + headerDataLength
-        appendBounded(videoPesBuffer, packet, bodyOffset, offset + length - bodyOffset)
+        val pesLength = ((packet[offset + 4].toInt() and 0xff) shl 8) or (packet[offset + 5].toInt() and 0xff)
+        if (pesLength != 0 && pesLength < 3 + headerDataLength) return
+        videoRemaining = if (pesLength == 0) -1 else pesLength - 3 - headerDataLength
+        videoActive = videoRemaining != 0
+        appendVideo(packet, bodyOffset, offset + length - bodyOffset)
     }
 
     private fun parseAudioPesHeader(packet: ByteArray, offset: Int, length: Int) {
-        if (!isPesHeader(packet, offset, length) || length < 9) { appendBounded(audioPesBuffer, packet, offset, length); return }
+        audioActive = false
+        if (!isPesHeader(packet, offset, length) || length < 9) return
         val headerDataLength = packet[offset + 8].toInt() and 0xff
         if (headerDataLength > length - 9) { audioPesBuffer.reset(); return }
         val flags = packet[offset + 7].toInt() and 0xff
         if (((flags ushr 6) and 3) >= 2 && headerDataLength >= 5) currentAudioPtsUs = ptsUs(packet, offset + 9)
         val bodyOffset = offset + 9 + headerDataLength
-        appendBounded(audioPesBuffer, packet, bodyOffset, offset + length - bodyOffset)
+        val pesLength = ((packet[offset + 4].toInt() and 0xff) shl 8) or (packet[offset + 5].toInt() and 0xff)
+        if (pesLength != 0 && pesLength < 3 + headerDataLength) return
+        audioRemaining = if (pesLength == 0) -1 else pesLength - 3 - headerDataLength
+        audioActive = audioRemaining != 0
+        appendAudio(packet, bodyOffset, offset + length - bodyOffset)
     }
 
     private fun ptsUs(packet: ByteArray, offset: Int): Long {
@@ -252,39 +318,65 @@ class TsDemuxer(
         return pts90k * 1000L / 90L
     }
 
-    private fun flushVideoPesBuffer() {
-        val data = videoPesBuffer.toByteArray(); videoPesBuffer.reset()
-        emitNalUnits(data, currentVideoPtsUs)
+    private fun appendVideo(data: ByteArray, offset: Int, length: Int) {
+        val take = if (videoRemaining >= 0) minOf(length, videoRemaining) else length
+        appendBounded(videoPesBuffer, data, offset, take, videoPid)
+        if (videoRemaining >= 0) {
+            videoRemaining -= take
+            if (videoRemaining == 0) { flushVideoPesBuffer(); videoActive = false }
+        }
     }
 
-    private fun emitNalUnits(data: ByteArray, ptsUs: Long) {
-        var start = -1; var i = 0
-        while (i + 2 < data.size) {
-            val three = data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()
-            val four = i + 3 < data.size && data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()
-            if (three || four) {
-                if (start >= 0) onVideoNaluExtracted(data.copyOfRange(start, i), ptsUs)
-                start = i; i += if (four) 4 else 3
+    private fun appendAudio(data: ByteArray, offset: Int, length: Int) {
+        val take = if (audioRemaining >= 0) minOf(length, audioRemaining) else length
+        appendBounded(audioPesBuffer, data, offset, take, audioPid)
+        if (audioRemaining >= 0) {
+            audioRemaining -= take
+            if (audioRemaining == 0) { flushAudioPesBuffer(); audioActive = false }
+        }
+    }
+
+    private fun flushVideoPesBuffer() {
+        if (videoPesBuffer.size() == 0) return
+        val data = videoPesBuffer.toByteArray(); videoPesBuffer.reset()
+        var hasIdr = false
+        var hasSlice = false
+        var i = 0
+        while (i + 3 < data.size) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
+                val type = data[i + 3].toInt() and 0x1f
+                if (type == 5) hasIdr = true
+                if (type in 1..5) hasSlice = true
+                i += 3
             } else i++
         }
-        if (start >= 0 && start < data.size) onVideoNaluExtracted(data.copyOfRange(start, data.size), ptsUs)
+        if (awaitingIdr && hasSlice && !hasIdr) return
+        if (hasIdr) awaitingIdr = false
+        // Keep SPS/PPS and all slices together: one PES carries the source AU and its PTS.
+        onVideoNaluExtracted(data, currentVideoPtsUs)
     }
 
     private fun flushAudioPesBuffer() {
+        if (audioPesBuffer.size() <= 4) { audioPesBuffer.reset(); return }
         val raw = audioPesBuffer.toByteArray(); audioPesBuffer.reset()
-        if (raw.size <= 4) return
-        val pcm = ByteArray(raw.size - 4)
+        // WFD LPCM: four-byte private header, 16-bit big-endian stereo 48 kHz.
+        // Refuse unsupported source formats rather than rendering compressed bytes as PCM.
+        val format = raw[3].toInt() and 0xff
+        if (raw[0].toInt() and 0xff != 0xa0 || format != 0x11) return
+        val pcm = ByteArray((raw.size - 4) and -4)
         var i = 0
         while (i + 1 < pcm.size) { pcm[i] = raw[i + 5]; pcm[i + 1] = raw[i + 4]; i += 2 }
-        if (i < pcm.size) pcm[i] = raw[i + 4]
-        onAudioFrameExtracted(pcm, 48000, 2)
+        onAudioFrameExtracted(pcm, 48000, 2, currentAudioPtsUs)
     }
 
-    private fun appendBounded(out: ByteArrayOutputStream, data: ByteArray, offset: Int, length: Int) {
+    private fun appendBounded(out: ByteArrayOutputStream, data: ByteArray, offset: Int, length: Int, pid: Int) {
         if (length <= 0 || offset < 0 || offset > data.size - length) return
-        if (out.size() + length > MAX_PES_BYTES) { out.reset(); Log.w(TAG, "Dropping oversized PES") ; return }
+        if (out.size() + length > MAX_PES_BYTES) {
+            discardPid(pid)
+            DebugEventLog.recordRateLimited(DebugEventCategory.MEDIA, "ts-pes-size", "Dropping oversized PES"); return
+        }
         out.write(data, offset, length)
     }
 
-    private companion object { const val TAG = "TsDemuxer"; const val MAX_PES_BYTES = 4 * 1024 * 1024 }
+    private companion object { const val MAX_PES_BYTES = 4 * 1024 * 1024 }
 }

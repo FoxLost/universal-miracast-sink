@@ -13,6 +13,7 @@ enum class DebugEventCategory {
     RTSP,
     RTP,
     MEDIA,
+    UIBC,
     ERROR,
 }
 

@@ -37,6 +37,7 @@ data class RtspTransport(
                 val separator = part.indexOf('=')
                 val key = (if (separator < 0) part else part.substring(0, separator)).trim().lowercase()
                 if (key.isEmpty()) continue
+                if (params.containsKey(key)) return null
                 params[key] = if (separator < 0) null else part.substring(separator + 1).trim()
             }
             fun portPair(name: String): Pair<Int?, Int?> {
@@ -49,9 +50,8 @@ data class RtspTransport(
             fun number(name: String): Long? {
                 val original = params[name] ?: return null
                 val raw = original.removePrefix("0x").removePrefix("0X")
-                // Explicit 0x values are hexadecimal; unprefixed values are
-                // decimal in common Windows transports, with hex fallback.
-                return if (original.startsWith("0x", true)) {
+                // RFC 2326 Transport SSRC is hexadecimal, including digit-only values.
+                return if (name == "ssrc" || original.startsWith("0x", true)) {
                     raw.toLongOrNull(16)
                 } else {
                     raw.toLongOrNull(10) ?: raw.toLongOrNull(16)
@@ -59,6 +59,11 @@ data class RtspTransport(
             }
             val client = portPair("client_port")
             val server = portPair("server_port")
+            if (params.containsKey("client_port") && (client.first == null ||
+                    params["client_port"]?.contains('-') == true && client.second == null) ||
+                params.containsKey("server_port") && (server.first == null ||
+                    params["server_port"]?.contains('-') == true && server.second == null)
+            ) return null
             return RtspTransport(
                 profile = profile,
                 unicast = params.containsKey("unicast"),
@@ -80,8 +85,8 @@ object RtspCodec {
     private const val MAX_BODY_BYTES = 4 * 1024 * 1024
 
     fun readMessage(input: InputStream): RtspMessage? {
-        val first = readLine(input) ?: return null
-        if (first.isEmpty()) return readMessage(input)
+        var first = readLine(input) ?: return null
+        while (first.isEmpty()) first = readLine(input) ?: return null
         val headers = linkedMapOf<String, String>()
         while (true) {
             val line = readLine(input) ?: throw EOFException("RTSP headers ended before blank line")
@@ -90,9 +95,14 @@ object RtspCodec {
             if (colon <= 0) continue
             val name = line.substring(0, colon).trim().lowercase()
             val value = line.substring(colon + 1).trim()
+            require(name !in setOf("cseq", "session", "content-length") || !headers.containsKey(name)) {
+                "duplicate RTSP $name"
+            }
             headers[name] = if (headers.containsKey(name)) "${headers[name]}, $value" else value
         }
-        val contentLength = headers["content-length"]?.trim()?.toLongOrNull() ?: 0L
+        val contentLength = headers["content-length"]?.let {
+            it.trim().toLongOrNull() ?: throw IllegalArgumentException("invalid RTSP Content-Length")
+        } ?: 0L
         require(contentLength in 0..MAX_BODY_BYTES) { "invalid RTSP Content-Length: $contentLength" }
         val body = ByteArray(contentLength.toInt())
         readFully(input, body)

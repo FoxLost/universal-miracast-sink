@@ -2,85 +2,129 @@ package foxlost.miracast.sink
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class P2pPeerAddressResolverTest {
-    @Test
-    fun parsesKernelArpRowsAndNormalizesMac() {
-        val table = """
-            IP address       HW type     Flags       HW address            Mask     Device
-            192.168.49.2     0x1         0x2         3E:3A:2C:35:09:2D     *        p2p0
-            0.0.0.0          0x0         0x0         00:00:00:00:00:00     *        p2p0
-        """.trimIndent()
+    private val device = "96:08:53:3b:71:33"
+    private val iface = "a6:08:53:3b:71:33"
 
-        assertEquals(
-            mapOf("3e:3a:2c:35:09:2d" to "192.168.49.2"),
-            P2pPeerAddressResolver.parseArpTable(table),
-        )
-    }
-    @Test
-    fun fallsBackToRootReaderWhenDirectProcfsReadFails() {
-        var rootReads = 0
-        val table = P2pPeerAddressResolver.readTableWithFallback(
-            directReader = { throw SecurityException("EACCES") },
-            rootReader = {
-                rootReads++
-                "192.168.49.2 0x1 0x2 3e:3a:2c:35:09:2d * p2p0"
-            },
-        )
-
-        assertEquals(1, rootReads)
-        assertEquals("192.168.49.2 0x1 0x2 3e:3a:2c:35:09:2d * p2p0", table)
+    private class Lookup {
+        var millis = 0L
+        var current = true
+        fun resolve(peer: String, table: () -> String?, identity: () -> String? = { null }): String? =
+            P2pPeerAddressResolver.resolveFromArp(peer, "p2p0", "192.168.28.29", 0L,
+                identity, table, { current }, { millis * 1_000_000 }, { millis += it })
     }
 
-    @Test
-    fun doesNotInvokeRootReaderWhenDirectProcfsReadSucceeds() {
-        var rootReads = 0
-        val table = P2pPeerAddressResolver.readTableWithFallback(
-            directReader = { "direct arp table" },
-            rootReader = {
-                rootReads++
-                "root arp table"
-            },
-        )
-
-        assertEquals(0, rootReads)
-        assertEquals("direct arp table", table)
+    @Test fun cereusInterfaceIdentityCanArriveAfterTheOldTwoSecondCutoff() {
+        val lookup = Lookup()
+        val ip = lookup.resolve(device,
+            table = { "192.168.28.30 0x1 0x2 $iface * p2p0\n" },
+            identity = { if (lookup.millis >= 3_000) iface else null })
+        assertEquals("192.168.28.30", ip)
+        assertEquals(87_000, remainingControlConnectMs(0, lookup.millis * 1_000_000))
     }
 
-    @Test
-    fun retriesUntilPeerAddressAppears() {
-        val tables = listOf(
-            "IP address HW type Flags HW address Mask Device\n",
-            "IP address HW type Flags HW address Mask Device\n" +
-                "192.168.49.2 0x1 0x2 3e:3a:2c:35:09:2d * p2p0\n",
+    @Test fun exactLegacyPeerIdentityStillResolvesWithoutAnAlias() {
+        assertEquals("192.168.28.30", Lookup().resolve(device.uppercase(),
+            { "192.168.28.30 0x1 0x2 ${device.uppercase()} * p2p0\n" }))
+    }
+
+    @Test fun authoritativeInterfaceIdentityWinsOverAStaleDeviceAddress() {
+        val table = "192.168.28.99 0x1 0x2 $device * p2p0\n" +
+            "192.168.28.30 0x1 0x2 $iface * p2p0\n"
+        assertEquals("192.168.28.30", Lookup().resolve(device, { table }, { iface }))
+    }
+
+    @Test fun unknownPeerNeverUsesTheFirstOrOnlyOtherNeighbor() {
+        val lookup = Lookup()
+        assertNull(lookup.resolve(device, { "192.168.28.30 0x1 0x2 $iface * p2p0\n" }))
+        assertEquals(90_000L, lookup.millis)
+    }
+
+    @Test fun wrongInterfaceIncompleteSelfAndInvalidIpv4AreNotReady() {
+        val rejected = listOf(
+            "192.168.28.30 0x1 0x2 $iface * wlan0",
+            "192.168.28.30 0x1 0x0 $iface * p2p0",
+            "192.168.28.29 0x1 0x2 $iface * p2p0",
+            "999.168.28.30 0x1 0x2 $iface * p2p0",
+            "127.0.0.1 0x1 0x2 $iface * p2p0",
+            "224.0.0.1 0x1 0x2 $iface * p2p0",
         )
+        for (row in rejected) assertNull(row, Lookup().resolve(device, { row }, { iface }))
+    }
+
+    @Test fun multiplePeerIpv4AddressesAreNotGuessed() {
+        val table = "192.168.28.30 0x1 0x2 $iface * p2p0\n" +
+            "192.168.28.31 0x1 0x2 $iface * p2p0\n"
+        assertNull(Lookup().resolve(device, { table }, { iface }))
+    }
+
+    @Test fun cancelledAttemptCannotPublishAnAddressReturnedByAnInflightRead() {
+        val lookup = Lookup()
+        assertNull(lookup.resolve(device, {
+            lookup.current = false
+            "192.168.28.30 0x1 0x2 $iface * p2p0\n"
+        }, { iface }))
+    }
+
+    @Test fun expiredSharedWindowCannotPublishALateAddress() {
+        val lookup = Lookup()
+        assertNull(lookup.resolve(device, {
+            lookup.millis = 90_000
+            "192.168.28.30 0x1 0x2 $iface * p2p0\n"
+        }, { iface }))
+    }
+
+    @Test fun failedRootOwnerIsNotRetriedAsPeerReadiness() {
+        val lookup = Lookup()
+        val failure = IllegalStateException("Root socket owner EOF")
         var reads = 0
-        val sleeps = mutableListOf<Long>()
-
-        val address = P2pPeerAddressResolver.resolveFromArp(
-            peerMac = "3E:3A:2C:35:09:2D",
-            readTable = { tables[reads++].also { } },
-            attempts = 2,
-            retryDelayMs = 25L,
-            sleeper = { sleeps += it },
-        )
-
-        assertEquals("192.168.49.2", address)
-        assertEquals(listOf(25L), sleeps)
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            lookup.resolve(device, {
+                reads++
+                throw failure
+            }, { iface })
+        }
+        assertSame(failure, thrown)
+        assertEquals(1, reads)
+        assertEquals(0L, lookup.millis)
     }
 
-    @Test
-    fun boundedLookupReturnsNullWhenPeerIsAbsent() {
-        var reads = 0
-        val address = P2pPeerAddressResolver.resolveFromArp(
-            peerMac = "3e:3a:2c:35:09:2d",
-            readTable = { reads++; "" },
-            attempts = 3,
-            retryDelayMs = 0L,
-        )
+    @Test fun failedInterfaceQueryDoesNotFallBackToAStaleDeviceRow() {
+        val failure = IllegalStateException("Invalid peer interface reply")
+        val thrown = assertThrows(IllegalStateException::class.java) {
+            Lookup().resolve(device,
+                { throw AssertionError("ARP must not be queried after an IPC failure") },
+                { throw failure })
+        }
+        assertSame(failure, thrown)
+    }
 
-        assertNull(address)
-        assertEquals(3, reads)
+    @Test fun cancelledInterfaceReadDoesNotStartAnotherRootQuery() {
+        val lookup = Lookup()
+        assertNull(lookup.resolve(device,
+            { throw AssertionError("Cancelled resolver must not query ARP") },
+            { lookup.current = false; iface }))
+    }
+
+    @Test fun expiredInterfaceReadDoesNotStartAnotherRootQuery() {
+        val lookup = Lookup()
+        assertNull(lookup.resolve(device,
+            { throw AssertionError("Expired resolver must not query ARP") },
+            { lookup.millis = 90_000; iface }))
+    }
+
+    @Test fun interruptedResolverDoesNotStartRootQueries() {
+        Thread.currentThread().interrupt()
+        try {
+            assertNull(Lookup().resolve(device,
+                { throw AssertionError("Interrupted resolver must not query ARP") },
+                { throw AssertionError("Interrupted resolver must not query peer identity") }))
+        } finally {
+            Thread.interrupted()
+        }
     }
 }

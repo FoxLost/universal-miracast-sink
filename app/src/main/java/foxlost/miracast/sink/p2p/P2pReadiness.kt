@@ -17,8 +17,8 @@ internal class GroupReadinessGate(
         interfaceUp: Boolean,
         ipv4Present: Boolean,
     ): Result {
-        if (groupFormed && peerPresent && interfaceUp && ipv4Present) return Result.Ready
-        return if (elapsedMs >= timeoutMs) Result.TimedOut else Result.Waiting
+        if (elapsedMs >= timeoutMs) return Result.TimedOut
+        return if (groupFormed && peerPresent && interfaceUp && ipv4Present) Result.Ready else Result.Waiting
     }
 
     companion object {

@@ -42,4 +42,10 @@ class DebugEventLogTest {
         assertTrue(DebugEventLog.recordRateLimited(DebugEventCategory.RTP, "counter", "count=3", 1_000L, 1_100L))
         assertEquals(listOf("count=1", "count=3"), DebugEventLog.events.value.map { it.message })
     }
+
+    @Test
+    fun supportsUibcDiagnosticsCategory() {
+        DebugEventLog.record(DebugEventCategory.UIBC, "UIBC disabled", 20L)
+        assertEquals(DebugEventCategory.UIBC, DebugEventLog.events.value.single().category)
+    }
 }

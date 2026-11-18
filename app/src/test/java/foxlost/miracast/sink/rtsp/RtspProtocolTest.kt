@@ -40,10 +40,28 @@ class RtspProtocolTest {
     }
 
     @Test
-    fun rejectsMalformedTransportPortValuesWithoutRejectingTransport() {
-        val transport = RtspTransport.parse("RTP/AVP/UDP;unicast;server_port=0-70000")
-        assertNotNull(transport)
-        assertNull(transport!!.serverRtpPort)
-        assertNull(transport.serverRtcpPort)
+    fun rejectsMalformedTransportPortValues() {
+        assertNull(RtspTransport.parse("RTP/AVP/UDP;unicast;server_port=0-70000"))
+        assertNull(RtspTransport.parse("RTP/AVP/UDP;unicast;client_port=15550-bad"))
+        assertNull(RtspTransport.parse("RTP/AVP/UDP;unicast;client_port=15550;client_port=15552"))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsMalformedContentLengthInsteadOfDesynchronizingNextMessage() {
+        RtspCodec.readMessage(ByteArrayInputStream(
+            "SET_PARAMETER * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: junk\r\n\r\nbody".toByteArray()
+        ))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsDuplicateCseqInsteadOfCombiningTransactionIds() {
+        RtspCodec.readMessage(ByteArrayInputStream(
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nCSeq: 2\r\n\r\n".toByteArray()
+        ))
+    }
+
+    @Test
+    fun transportSsrcUsesHexEvenWhenItContainsOnlyDigits() {
+        assertEquals(0x12345678L, RtspTransport.parse("RTP/AVP/UDP;unicast;ssrc=12345678")!!.ssrc)
     }
 }

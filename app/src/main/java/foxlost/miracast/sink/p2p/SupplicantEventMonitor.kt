@@ -1,77 +1,70 @@
 package foxlost.miracast.sink.p2p
 
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
+import android.system.Os
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
-/**
- * wpa_supplicant control-interface EVENT MONITOR, run as root via:
- *   CLASSPATH=<apk> app_process / foxlost.miracast.sink.p2p.SupplicantEventMonitor <sock>
- *
- * Attaches (ATTACH) to the supplicant control socket and streams every
- * unsolicited event line (P2P-GO-NEG-REQUEST, P2P-PROV-DISC-*, ...) to stdout,
- * one per line, flushed. The hosting app spawns this via `su` and parses the
- * stream to drive the headless auto-accept flow.
- *
- * Why this exists: the framework answers an incoming GO Negotiation Request
- * with Status 1 ("not ready") until someone calls p2pConnect(). Stock Android
- * does that from the Accept button of a system dialog (notifyInvitationReceived
- * shows an AlertDialog — there is NO broadcast to observe). A headless sink
- * has no user, so we watch the supplicant directly and arm it ourselves.
- *
- * NOTE: the client socket path must be world-writable — the supplicant runs
- * as the `wifi` user and detaches monitors whose event delivery fails with
- * EACCES (observed on-device: "ctrl_iface sendto failed: 13").
- */
+/** Root-discovered fixed monitor. Parent pipe EOF closes the socket and exits. */
 object SupplicantEventMonitor {
-
     @JvmStatic
     fun main(args: Array<String>) {
-        val socketPath = args.getOrNull(0) ?: run {
-            System.err.println("Usage: SupplicantEventMonitor <socket-path>")
-            return
-        }
+        val ownerEnded = AtomicBoolean(false)
         try {
-            val socket = LocalSocket(LocalSocket.SOCKET_DGRAM)
-            val clientPath = "${socketPath}_mon${android.os.Process.myPid()}"
-            socket.bind(LocalSocketAddress(clientPath, LocalSocketAddress.Namespace.FILESYSTEM))
-            // Supplicant (uid wifi) must be able to sendto() our socket or it
-            // will detach us. We run as root, so chmod the endpoint open.
-            try { android.system.Os.chmod(clientPath, 0b111111111) } catch (_: Exception) {}
-
-            socket.connect(LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM))
-            socket.outputStream.write("ATTACH\n".toByteArray())
-            socket.outputStream.flush()
-
-            val inp = socket.inputStream
-            val buf = ByteArray(4096)
-            val pending = StringBuilder()
-            fun emitCompleteLines() {
-                while (true) {
-                    val newline = pending.indexOf("\n")
-                    if (newline < 0) return
-                    val line = pending.substring(0, newline).trim()
-                    pending.delete(0, newline + 1)
-                    if (line.isNotEmpty()) {
-                        println(line)
+            check(args.isEmpty() && Os.getuid() == 0) { "Root launch required" }
+            var attached: SupplicantWriter.Connection? = null
+            var transportFailure: Exception? = null
+            val deadline = System.nanoTime() + 8_000_000_000L
+            for ((iface, path) in SupplicantWriter.candidates()) {
+                if (System.nanoTime() >= deadline) break
+                val connection = try { SupplicantWriter.Connection(iface, path) } catch (e: Exception) {
+                    transportFailure = e
+                    continue
+                }
+                try {
+                    connection.attach()
+                    attached = connection
+                    break
+                } catch (e: Exception) { transportFailure = e; connection.close() }
+            }
+            val connection = attached ?: throw IllegalStateException(
+                "No verified supplicant monitor transport: ${transportFailure?.message ?: "no socket candidates"}",
+                transportFailure
+            )
+            connection.use {
+                thread(name = "Monitor-owner", isDaemon = true) {
+                    try {
+                        while (System.`in`.read() != -1) { }
+                        ownerEnded.set(true)
+                    } catch (e: IOException) {
+                        System.err.println("MONITOR_OWNER_ERR: ${e.message}")
+                    } finally {
+                        try { connection.close() } catch (e: IOException) {
+                            System.err.println("MONITOR_CLOSE_ERR: ${e.message}")
+                        }
+                    }
+                }
+                // A finite idle receive also observes EOF if close(2) cannot wake
+                // an in-flight datagram syscall on this vendor kernel.
+                connection.socket.soTimeout = 1000
+                println("MONITOR_READY")
+                System.out.flush()
+                while (!ownerEnded.get()) {
+                    val event = try { connection.nextEvent() } catch (e: android.system.ErrnoException) {
+                        if (e.errno == android.system.OsConstants.EAGAIN) continue
+                        throw e
+                    }
+                    if (event.startsWith("<") || event.startsWith("IFNAME=")) {
+                        println(event)
                         System.out.flush()
                     }
                 }
             }
-            while (true) {
-                val n = inp.read(buf)
-                if (n <= 0) break
-                pending.append(String(buf, 0, n, Charsets.UTF_8))
-                emitCompleteLines()
-            }
-            // Datagram/socket implementations normally terminate records with
-            // LF, but do not silently lose a final partial event on EOF.
-            val last = pending.toString().trim()
-            if (last.isNotEmpty()) {
-                println(last)
-                System.out.flush()
-            }
         } catch (e: Exception) {
-            System.err.println("MONITOR-ERR: ${e.message}")
+            if (!ownerEnded.get()) {
+                System.err.println("MONITOR_ERR: ${e.message}")
+                kotlin.system.exitProcess(1)
+            }
         }
     }
 }

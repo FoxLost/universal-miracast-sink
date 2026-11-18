@@ -1,74 +1,106 @@
-# RTSP Package (`rtsp`)
+# RTSP package
 
-RTSP (Real-Time Streaming Protocol) server and connection handler for WFD capability negotiation (M1-M7 messages per Wi-Fi Display specification).
+`RtspConnection` adapts a socket to the single `RtspSessionEngine` state machine;
+`RtspProtocol` handles byte-counted RTSP messages and UDP Transport parsing.
+TCP entry direction does not determine Wi-Fi Direct GO ownership or reverse
+the WFD source/sink roles. The sink initiates TCP to the source's advertised
+control port. The unused inbound server, legacy responder, and callback-only
+constructors have been removed.
 
-## Files
+## Session flow
 
-### `RtspServer.kt` — TCP Server on Port 7236
+Following Wi-Fi Display Technical Specification v2.1 sections 4.5.4 and 6.4:
 
-Binds a `ServerSocket` on the specified port with `reuseAddress=true`. Accepts incoming TCP connections and spawns `RtspConnection` handlers.
+1. Source sends M1 OPTIONS; sink acknowledges before sending M2 OPTIONS.
+2. Matching successful M2 completes method negotiation; no sink-first OPTIONS.
+3. Source M3 GET_PARAMETER queries receive the sink's capability snapshot.
+   The RTP receiver is bound before a capability response is constructed.
+4. Source M4 SET_PARAMETER selections are validated against that same snapshot.
+   Unsupported codecs, protected media, TCP RTP, malformed selections, and
+   invalid presentation URLs are rejected rather than falsely acknowledged.
+   Unknown extension names are not treated as implemented media features.
+   Selection before M3 receives 455. Split selections accumulate only after
+   acceptance; SETUP needs a primary presentation URL and selected video or audio.
+   Media diagnostics report actual M3 response fields only after the response
+   write succeeds, and M4 media selections only after validation, a successful
+   200 write and commit. Rejections are distinct. Selected CEA FPS is nominal,
+   not measured presentation FPS; bounded media-only values exclude URLs,
+   device identity and raw payloads.
+5. Source M5 SETUP trigger is acknowledged before sink M6 SETUP. The selected
+   primary presentation URL (including its port/path) is used on the existing
+   control connection; the optional trailing `none` is not part of the URL.
+6. M6 must return a Session and unicast UDP Transport matching the offered
+   client ports. Only then is transport published and M7 PLAY sent.
+7. First successful PLAY starts media. An explicitly enabled second-PLAY quirk
+   is optional: its rejection, including the spec's already-playing 406, does
+   not invalidate the first successful PLAY.
 
-**Note**: While this server handles inbound connections, the primary WFD handshake is driven by `MiracastService.startRtspHandshake()` as a TCP **client** connecting to the source's RTSP port. The inbound server handles additional connections (e.g., from the source, self-tests, or secondary WFD sessions).
+Later source SET_PARAMETER triggers PLAY, PAUSE, and TEARDOWN are acknowledged
+before the corresponding sink-to-source request. TEARDOWN closes after its
+response, or on failure/deadline. Direct source SETUP/PLAY/PAUSE/TEARDOWN methods
+receive 405: the source is the RTSP server even if the sink is the P2P GO.
+Supported parameter updates remain legal after initial negotiation.
 
-### `RtspConnection.kt` — RTSP Session Handler
+CSeq responses must match an outstanding request and indicate success before
+advancing it. SETUP must create the Session. Later responses may omit its echo;
+the established ID is retained for subsequent sink requests. A supplied empty
+or different ID is rejected, not adopted. This applies to PLAY, PAUSE,
+TEARDOWN and optional recovery on the same control connection, independent
+of P2P role or source identity.
 
-Handles a single RTSP TCP session. Parses RTSP request/response lines, extracts headers (including `Content-Length` for body reading), and dispatches to appropriate handlers.
+Source GET_PARAMETER and SET_PARAMETER may also omit Session, including the
+empty M16 keepalive. A supplied empty or different ID receives 454. This follows
+WFD v2.1 Appendix E.1 (page 186), whose M7 response omits Session and whose
+note explicitly makes it optional for server-originated requests.
+Empty GET_PARAMETER is answered without initiating sink keepalive polling.
+Mandatory transactions have a 5-second response deadline; first M1 and
+pre-session negotiation progress have a 6-second deadline.
+After establishment, only source M16 refreshes the negotiated keepalive timeout
+(60 seconds by default, minimum 10 seconds), not arbitrary parameter requests.
+EOF, errors, timeout, and teardown close the socket, clear pending transactions,
+disable published UIBC, and notify session end once.
 
-**Request handling**:
-| Method | Response |
-|---|---|
-| `OPTIONS` | 200 OK + `Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER` |
-| `GET_PARAMETER` | 200 OK + sink video/audio/RTP/UIBC capabilities |
-| `SET_PARAMETER` | 200 OK; if `wfd_trigger_method: SETUP`, triggers SETUP→PLAY→onPlayTriggered |
-| `TEARDOWN` | 200 OK |
+## Optional UIBC and recovery
 
-**Protocol details**:
-- CSeq tracking via `AtomicInteger`
-- RTSP request/response format with proper `\r\n` line endings
-- Body reading using `Content-Length` header
-- UTF-8 encoding throughout
+The source owns the UIBC TCP listener and supplies its port in M4/M14.
+Capability/setting changes are committed only after the successful response has
+been written. A source-selected endpoint is not published until an explicit
+accepted `enable`/`enabled` setting; Android identity does not imply enablement.
+The local opt-in must also have been advertised in M3; a source cannot override
+a locally disabled UIBC offer.
+A later disable or endpoint replacement retires the optional input connection.
+UIBC connection/callback failures remain nonfatal to media.
 
-### `RtspHandler.kt` — Generic RTSP Request Handler (Legacy)
+M3 advertises `wfd_idr_request_capability: 1` because the sink implements M13.
+Requests use the negotiated Session, permit one in-flight optional request,
+and are rate limited. Rejected optional recovery does not end playback; a
+successful RTSP response is not proof that the source emitted an IDR picture.
 
-A simpler RTSP handler that responds to standard WFD RTSP methods. Kept for reference and potential use in scenarios where the Inbound RTSP server needs to handle more complex exchanges.
+## Reference-capture cross-check
 
-## WFD RTSP Methods
+The workspace's official Miralink reference recordings corroborate the two
+successful M7 variants, rather than requiring an Android-specific profile:
 
-| Method | Direction | Purpose |
-|---|---|---|
-| `OPTIONS` | Bidirectional | Capability discovery |
-| `GET_PARAMETER` | Source → Sink | Query sink capabilities (video/audio/RTP) |
-| `SET_PARAMETER` | Source → Sink | Set WFD parameters, trigger SETUP/TEARDOWN |
-| `SETUP` | Sink → Source | Establish RTP transport |
-| `PLAY` | Sink → Source | Start media streaming |
-| `TEARDOWN` | Bidirectional | End session |
+- `capture-android/android.pcap`: SETUP response frame 11027 establishes
+  `0000000a`; PLAY request 11028 uses it, and matching 200 response 11036 omits
+  Session. A subsequent PLAY receives 406, not a Session mismatch.
+- `capture-win/android.pcap`: SETUP response 24158 and PLAY response 24161
+  both carry `2001155254`.
+- `capture-newdevice/android.pcap`: SETUP response 10098 and PLAY response
+  10102 include `1804289383;timeout=30`; parameters are not part of the ID.
 
-## WFD Public Header (OPTIONS Response)
+These are separate reference runs, not a packet capture of the reported
+Redmi6 failure. They contain no established-session M16 exchange; headerless
+keepalive acceptance is grounded in Appendix E.1 and the socket/deadline
+regressions, not a claim of hardware-observed M16 behavior. Inspection skipped
+embedded text fragments in memory without modifying the original recordings.
 
-The Public header in OPTIONS responses advertises supported methods:
+## References
 
-- **Sink → Source**: `org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER`
-  (Sink handles parameter queries and triggers)
-- **Source → Sink**: `org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER`
-  (Source handles transport setup and stream control)
+- [Wi-Fi Alliance Wi-Fi Display Technical Specification v2.1](https://raw.githubusercontent.com/wiki/albfan/miraclecast/files/Wi-Fi_Display_Technical_Specification_v2.1_0.pdf), sections 4.5.4, 4.11.2, 6.4, 6.5.1 and Appendix E.1 (page 186: M7 Session omission and optional Session in source requests).
+- [AOSP WifiDisplaySource.cpp](https://android.googlesource.com/platform/frameworks/av/+/android-8.1.0_r1/media/libstagefright/wifi-display/source/WifiDisplaySource.cpp): `sendM4`, `sendTrigger`, `sendM16`, `onSetupRequest`.
+- [Historical AOSP WifiDisplaySink.cpp](https://android.googlesource.com/platform/frameworks/av/+/android-4.2.2_r1.2/media/libstagefright/wifi-display/sink/WifiDisplaySink.cpp): sink TCP client, M1/M2, Session/Transport parsing. This early experimental sink contains placeholder capabilities/URLs and sends SETUP before its trigger acknowledgement; those details are not normative templates.
 
-This matches real Android Wi-Fi Display source/sink behavior — verified against packet capture of a working Miralink receiver.
-
-## Sink Capabilities Response
-
-```
-wfd_video_formats: 00 00 01 10 0001bde1 00300000 000003c0
-wfd_audio_codecs: LPCM 00000002 00
-wfd_client_rtp_ports: RTP/AVP/UDP;unicast 15550 0 mode=play
-wfd_uibc_capability: input_category_list=GENERIC,HIDC; generic_cap_list=Keyboard,Mouse,SingleTouch,MultiTouch; hidc_cap_list=Keyboard/USB,Mouse/USB,SingleTouch/USB,MultiTouch/USB; port=none
-```
-
-## Trigger Method Flow
-
-The source sends `wfd_trigger_method: SETUP` and `wfd_trigger_method: TEARDOWN` as `SET_PARAMETER` body values to control the streaming lifecycle. The sink responds 200 OK to acknowledge, then performs the triggered action:
-- **SETUP trigger**: Sink sends `SETUP` → waits for 200 OK → sends `PLAY`
-- **TEARDOWN trigger**: Sink breaks the RTSP loop, broadcasts `SESSION_END`, returns to dashboard
-
-## Key Implementation Detail: `Public:` Header
-
-A critical bug was discovered during development: listing `SETUP, PLAY` in the sink's Public header (as the spec suggests) caused the source to disconnect P2P immediately. The real Android WFD stack only lists `GET_PARAMETER, SET_PARAMETER` in the sink's Public response — confirmed by packet capture of a working Miralink Miracast receiver.
+Consumer socket transcript tests cover the exchange and error paths rather
+than source-text/wiring assertions. These controls do not imply compatibility
+with every firmware, HDCP requirement, codec, or source variant.

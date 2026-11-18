@@ -2,29 +2,9 @@ package foxlost.miracast.sink.rtsp
 
 import foxlost.miracast.sink.SettingsManager
 
-/**
- * Builds the WFD M4 (GET_PARAMETER response) capability set.
- *
- * Mirrors the Xiaomi Pad 6 (MiPCExpend / libwfdsinker) behaviour observed in the
- * session capture: respond to every parameter the source asked about, using real
- * values where the Pad used them, "none" where the Pad used them, and OMIT the
- * wfd2_* family entirely (the Pad did not include them in its response).
- *
- * Responding only to requested parameters keeps the exchange RFC 2326 compliant
- * and safe for Android sources, which simply ignore the params they never asked
- * for. Windows queries up to 28 parameters (wfd_* + wfd2_* + intel_* +
- * microsoft_*); leaving any of them unanswered can make Windows abort.
- *
- * Device name, manufacturer, video profile, audio and throughput are pulled
- * live from [SettingsManager] so the Settings panel takes effect immediately.
- */
+/** WFD R1 capabilities, snapshotted for the session and never copied from another device. */
 object WfdCapabilities {
 
-    /**
-     * Unsupported optional capabilities must remain syntactically valid but
-     * must never claim an implementation that is not present.
-     */
-    private val OMITTED = emptySet<String>()
 
     private fun configuredRtpPort(): Int =
         safeSettings { rtpVideoPort }?.takeIf { it in 1..65534 } ?: SettingsManager.DEFAULT_RTP_VIDEO_PORT
@@ -37,34 +17,50 @@ object WfdCapabilities {
      * [rtpPort] is the port that the RTP receiver has actually bound, when
      * known; using it keeps M3 and SETUP consistent.
      */
-    fun buildResponse(requestBody: String, rtpPort: Int? = null): String {
-        val values = ordered(rtpPort ?: configuredRtpPort())
-        val byName = values.toMap()
+    fun buildResponse(
+        requestBody: String,
+        rtpPort: Int? = null,
+        uibcEnabled: Boolean? = null,
+        advertisedCapabilities: String? = null,
+    ): String {
+        val byName = WfdSelection.parameters(
+            advertisedCapabilities ?: fullResponse(rtpPort, uibcEnabled),
+        )
         val sb = StringBuilder()
         for (rawLine in requestBody.split('\n')) {
-            val param = rawLine.trim().removeSuffix("\r")
-            if (param.isEmpty() || param in OMITTED) continue
+            val param = rawLine.trim().substringBefore(':').lowercase(java.util.Locale.ROOT)
+            if (param.isEmpty()) continue
             sb.append(param).append(": ").append(byName[param] ?: "none").append("\r\n")
         }
         return sb.toString()
     }
 
     /** Full capability response without request filtering (diagnostic only). */
-    fun fullResponse(rtpPort: Int? = null): String {
+    fun fullResponse(rtpPort: Int? = null, uibcEnabled: Boolean? = null): String {
         val sb = StringBuilder()
-        for ((key, value) in ordered(rtpPort ?: configuredRtpPort())) {
+        for ((key, value) in ordered(
+            rtpPort ?: configuredRtpPort(),
+            uibcEnabled ?: (safeSettings { SettingsManager.uibcEnabled } == true),
+        )) {
             sb.append(key).append(": ").append(value).append("\r\n")
         }
         return sb.toString()
     }
 
-    private fun ordered(rtpPort: Int): List<Pair<String, String>> {
+    fun validateSelection(body: String, advertisedCapabilities: String? = null): String? =
+        WfdSelection.validate(body, advertisedCapabilities ?: fullResponse())
+
+    private fun ordered(rtpPort: Int, uibcEnabled: Boolean): List<Pair<String, String>> {
         val audio = if (safeSettings { audioEnabled } != false) "LPCM 00000002 00" else "none"
-        val video = safeSettings { videoFormatsForProfile() }
-            ?: ("00 00 01 10 0001bde1 00300000 000003c0 00 0000 0000 00 none none, " +
-                "02 10 0001bde1 00300000 000003c0 00 0000 0000 00 none none")
+        val video = safeSettings { videoFormats() } ?: "none"
         val devName = safeSettings { deviceName } ?: "Miracast Sink"
         val mfr = safeSettings { manufacturer } ?: "Android"
+        val uibc = if (uibcEnabled) {
+            "input_category_list=GENERIC, HIDC; generic_cap_list=SingleTouch, MultiTouch; " +
+                "hidc_cap_list=SingleTouch/USB, MultiTouch/USB; port=none"
+        } else {
+            "none"
+        }
 
         return listOf(
             "wfd_video_formats" to video,
@@ -72,8 +68,8 @@ object WfdCapabilities {
             "wfd_client_rtp_ports" to rtpCapability(rtpPort),
             "wfd_display_edid" to "none",
             "wfd_connector_type" to "05",
-            "wfd_idr_request_capability" to "0",
-            "wfd_uibc_capability" to "none",
+            "wfd_idr_request_capability" to "1",
+            "wfd_uibc_capability" to uibc,
             "wfd_content_protection" to "none",
             "intel_friendly_name" to devName,
             "intel_sink_manufacturer_name" to mfr,
@@ -97,8 +93,6 @@ object WfdCapabilities {
         )
     }
 
-    private fun valueFor(param: String, rtpPort: Int = configuredRtpPort()): String? =
-        ordered(rtpPort).firstOrNull { it.first == param }?.second
 
     /** Read a SettingsManager value, tolerating an uninitialized manager. */
     private inline fun <T> safeSettings(block: SettingsManager.() -> T): T? =

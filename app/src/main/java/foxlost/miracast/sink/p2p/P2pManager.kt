@@ -20,14 +20,24 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     private val channel: WifiP2pManager.Channel = wifiP2pManager.initialize(context, context.mainLooper, null)
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var isMiracastEnabled = false
+    @Volatile private var rootBridge: RootBridgeClient? = null
+    private var stopCompletion: java.util.concurrent.CompletableFuture<Boolean>? = null
+    private val retiredBridges = mutableListOf<RootBridgeClient>()
+    private data class AppConnect(val operation: P2pConnectOperation, val inspector: RootBridgeClient)
+    private val appConnectLock = Any()
+    private var appConnect: AppConnect? = null
+    private var sessionBand = P2pBand.AUTO
+    private val startRequestSerial = java.util.concurrent.atomic.AtomicLong()
+    private var disposed = false
+    @Volatile private var isMiracastEnabled = false
     @Volatile private var groupStarted = false
     private var discoveryRunnable: Runnable? = null
     private var listenRunnable: Runnable? = null
     private var keepAliveRunnable: Runnable? = null
     @Volatile private var extListenThread: Thread? = null
     private val attempts = P2pAttemptController()
-    private var sessionGeneration = 0L
+    private val readinessGate = GroupReadinessGate(GROUP_READINESS_TIMEOUT_MS)
+    @Volatile private var sessionGeneration = 0L
     @Volatile private var activeAttempt: P2pAttemptController.Token? = null
     private var cleanupBarrierRunnable: Runnable? = null
     private var invitationStallRunnable: Runnable? = null
@@ -36,12 +46,9 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     private var wfdSetupState = WfdSetupState.Idle
     private enum class WfdSetupState { Idle, FrameworkPending, FallbackPending, Ready, Failed }
     private var cleanupBarrierToken: P2pAttemptController.Token? = null
-    private var frameworkListenFallbackStarted = false
     private var p2pModeStarted = false
     private var readinessRunnable: Runnable? = null
     private var readinessProbeInFlight = false
-    private var readinessGroup: WifiP2pGroup? = null
-    private var readinessInfo: WifiP2pInfo? = null
     // Group formation can be reported through several framework/vendor paths.
     // Keep one transition gate so a persistent invitation does not start
     // duplicate RTSP sessions when those paths overlap.
@@ -55,7 +62,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         val groupSsid: String?,
         val groupBssid: String?,
         val opFrequency: Int?,
-        val persistent: Boolean?,
+        val persistent: String?,
         val accepted: Boolean = false,
         val fallbackScheduled: Boolean = false,
     )
@@ -79,7 +86,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         // WifiP2pConfig's hidden/default value (-2) allows the framework to
         // match a peer to a stale persistent group and call reinvoke(). A
         // headless connection request must never take that path.
-        const val NETWORK_ID_TEMPORARY = WifiP2pGroup.NETWORK_ID_TEMPORARY
+        private const val NETWORK_ID_TEMPORARY = -1
         // Android's WFD device-info bitfield for a primary, available sink
         // with no content-protection or service-discovery extensions.
         const val WFD_DEVICE_INFO = 0x0011
@@ -88,7 +95,9 @@ class P2pManager(private val context: Context, private val listener: P2pListener
 
         const val CLEANUP_BARRIER_TIMEOUT_MS = 2_000L
         const val CLEANUP_BARRIER_POLL_MS = 100L
-        const val INVITATION_FALLBACK_STALL_MS = 6_000L
+        // A fresh GO/WPS negotiation uses Android's native two-minute formation window,
+        // not the shorter IP/interface readiness deadline after GROUP-STARTED.
+        const val INVITATION_FALLBACK_STALL_MS = 120_000L
         const val DEFAULT_P2P_INTERFACE = "p2p0"
 
         internal fun invitationFallbackPeer(
@@ -147,6 +156,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         fun onP2pGroupDisconnected(attemptId: Long)
         fun onP2pAttemptFailed(attemptId: Long, reason: String) {}
         fun onP2pAttemptExhausted(attemptId: Long, reason: String) {}
+        fun onP2pStartupFailed(generation: Long, reason: String)
         fun onDiscoveryStateChanged(active: Boolean)
     }
 
@@ -154,6 +164,33 @@ class P2pManager(private val context: Context, private val listener: P2pListener
 
     @SuppressLint("MissingPermission")
     fun startSink(generation: Long = 0L) {
+        if (disposed) return
+        val stopping = stopCompletion
+        if (isMiracastEnabled || rootBridge != null || cleanupBarrierRunnable != null || stopping?.isDone == false) {
+            stopSink()
+            val request = startRequestSerial.get()
+            checkNotNull(stopCompletion).thenAccept { clean ->
+                mainHandler.post {
+                    if (disposed || startRequestSerial.get() != request) return@post
+                    if (clean) startSink(generation)
+                    else listener.onP2pStartupFailed(generation, "Previous P2P/root cleanup was not confirmed")
+                }
+            }
+            return
+        }
+        foxlost.miracast.sink.SettingsManager.init(context)
+        val requestedBand = foxlost.miracast.sink.SettingsManager.wifiBand
+        if (requestedBand == P2pBand.GHZ_5) {
+            val wifi = context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+            if (!requestedBand.supportedBy(wifi?.is5GHzBandSupported != false)) {
+                val reason = "5 GHz Wi-Fi is not supported by this device. Select Auto or 2.4 GHz."
+                Log.e(TAG, reason)
+                DebugEventLog.record(DebugEventCategory.ERROR, reason)
+                listener.onP2pStartupFailed(generation, reason)
+                return
+            }
+        }
+        startRequestSerial.incrementAndGet()
         Log.d(TAG, "Starting Miracast Sink generation=$generation...")
         DebugEventLog.record(DebugEventCategory.P2P, "P2P sink start generation=$generation")
         sessionGeneration = generation
@@ -163,30 +200,40 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         isMiracastEnabled = true
         val token = attempts.start(generation)
         activeAttempt = token
+        lastAutoAcceptAt = 0L
+        lastAutoAcceptAddr = null
         Log.i(TAG, "Starting P2P attempt ${token.number}/3 id=${token.attemptId}")
-        foxlost.miracast.sink.SettingsManager.init(context)
-
-        try {
-            android.provider.Settings.Global.putInt(context.contentResolver, "wifi_display_on", 0)
-            Log.d(TAG, "Disabled framework WifiDisplayController")
-        } catch (e: Exception) {
-            Log.d(TAG, "Failed to disable WifiDisplayController: ${e.message}")
+        sessionBand = requestedBand
+        val bandPolicy = when (sessionBand) {
+            P2pBand.AUTO -> 0
+            P2pBand.GHZ_2_4 -> 1
+            P2pBand.GHZ_5 -> 2
         }
+        DebugEventLog.record(DebugEventCategory.P2P,
+            "P2P band policy generation=$generation policy=$bandPolicy (0=auto,1=2.4GHz,2=5GHz)")
 
-        // Disconnect Wi-Fi STA to eliminate single-radio channel conflict.
-        // When STA is on ch5 and P2P listens on ch11, the radio time-shares
-        // between channels, causing extended-listen windows to be skipped
-        // and GO-neg frames to arrive during IDLE gaps. Disconnecting gives
-        // P2P the full radio on the listen channel.
-        val disconnectWifi = try { foxlost.miracast.sink.SettingsManager.disconnectWifiInSinkMode } catch (e: Exception) { true }
-        if (disconnectWifi) {
-            disconnectWifiSta()
+        // A restarted app can inherit a native P2P group even when no Java
+        // session remains. Do not advertise or accept it as a fresh session.
+        cleanupAttempt(token) { clean ->
+            if (!isMiracastEnabled || !attempts.accepts(token)) return@cleanupAttempt
+            if (!clean) {
+                failAttempt(token, "P2P previous group cleanup was not confirmed")
+                return@cleanupAttempt
+            }
+            rootBridge = RootBridgeClient(context)
+            chainWfdInfo()
         }
-        setMiracastModeSink()
-        chainWfdInfo()
     }
     @SuppressLint("MissingPermission")
-    fun stopSink() {
+    fun stopSink(onComplete: ((Boolean) -> Unit)? = null) {
+        startRequestSerial.incrementAndGet()
+        stopCompletion?.takeIf { !it.isDone }?.let { pending ->
+            if (onComplete != null) pending.thenAccept { clean -> mainHandler.post { onComplete(clean) } }
+            return
+        }
+        val completion = java.util.concurrent.CompletableFuture<Boolean>()
+        stopCompletion = completion
+        if (onComplete != null) completion.thenAccept { clean -> mainHandler.post { onComplete(clean) } }
         groupStarted = false
         Log.d(TAG, "Stopping Miracast Sink...")
         DebugEventLog.record(DebugEventCategory.P2P, "P2P sink stopping")
@@ -201,8 +248,6 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         readinessRunnable?.let { mainHandler.removeCallbacks(it) }
         readinessRunnable = null
         readinessProbeInFlight = false
-        readinessGroup = null
-        readinessInfo = null
         stopDiscoveryLoop()
         cancelExtendedListen()
         listenRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -211,7 +256,9 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         keepAliveRunnable = null
         stopSupplicantMonitor()
         stopListeningFramework()
-        try { wpaCli("P2P_EXT_LISTEN 0 0") } catch (_: Exception) {}
+        val frameworkOwner = rootBridge
+        frameworkOwner?.let { retiredBridges += it }
+        rootBridge = null
         activeAttempt = null
         synchronized(groupStateLock) {
             activeGroupIdentity = null
@@ -219,19 +266,83 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             groupTransitionPending = false
             pendingInvitation = null
         }
-        try {
-            wifiP2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.d(TAG, "removeGroup SUCCESS") }
-                override fun onFailure(reason: Int) { Log.d(TAG, "removeGroup ignored reason=$reason") }
-            })
-        } catch (e: Exception) {
-            Log.d(TAG, "removeGroup unavailable: ${e.message}")
+        // This gate is deliberately independent of attempt tokens: stop cancels those tokens.
+        val retiring = retiredBridges.toList()
+        val appOwner = synchronized(appConnectLock) { appConnect }
+        thread(name = "P2P-StopBarrier") {
+            val appRestored = settleAppConnect(appOwner)
+            frameworkOwner?.close()
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(45)
+            var restored = true
+            retiring.forEach { bridge ->
+                val clean = try {
+                    bridge.closedAndRestored.get(
+                        (deadline - System.nanoTime()).coerceAtLeast(1),
+                        java.util.concurrent.TimeUnit.NANOSECONDS,
+                    )
+                } catch (_: Exception) { false }
+                restored = clean && restored
+            }
+            val remainingOwnersRestored = RootBridgeClient.awaitCleanup(
+                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis((deadline - System.nanoTime()).coerceAtLeast(1)),
+            )
+            val allOwnersRestored = restored && appRestored && remainingOwnersRestored
+            mainHandler.post {
+                // Remove only after the owner has settled CONNECT: formation can
+                // race EOF/cancellation and create a group after an earlier query.
+                // Still attempt group cleanup if helper restoration was unsuccessful.
+                try {
+                    wifiP2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() { Log.d(TAG, "removeGroup SUCCESS") }
+                        override fun onFailure(reason: Int) { Log.d(TAG, "removeGroup request failed reason=$reason") }
+                    })
+                } catch (e: Exception) {
+                    Log.d(TAG, "removeGroup unavailable: ${e.message}")
+                }
+                if (!allOwnersRestored) {
+                    DebugEventLog.record(DebugEventCategory.ERROR, "P2P root restoration unconfirmed")
+                    completion.complete(false)
+                } else {
+                    retiredBridges.removeAll(retiring.toSet())
+                    confirmStoppedGroup(completion)
+                }
+            }
         }
-        reconnectWifiSta()
     }
-    fun reportAttemptFailure(attemptId: Long, reason: String) {
+
+    @SuppressLint("MissingPermission")
+    private fun confirmStoppedGroup(completion: java.util.concurrent.CompletableFuture<Boolean>) {
+        val deadline = android.os.SystemClock.elapsedRealtime() + CLEANUP_BARRIER_TIMEOUT_MS
+        val poll = object : Runnable {
+            override fun run() {
+                if (completion.isDone) return
+                try {
+                    wifiP2pManager.requestGroupInfo(channel) { group ->
+                        if (completion.isDone) return@requestGroupInfo
+                        if (group == null) completion.complete(true)
+                        else if (android.os.SystemClock.elapsedRealtime() < deadline)
+                            mainHandler.postDelayed(this, CLEANUP_BARRIER_POLL_MS)
+                        else completion.complete(false)
+                    }
+                } catch (_: Exception) { completion.complete(false) }
+            }
+        }
+        mainHandler.post(poll)
+        mainHandler.postDelayed({ completion.complete(false) }, CLEANUP_BARRIER_TIMEOUT_MS)
+    }
+
+    /** Retire the app's framework channel only after its final cleanup query. */
+    fun dispose() {
+        disposed = true
+        startRequestSerial.incrementAndGet()
+        val pending = stopCompletion
+        if (pending == null) stopSink { channel.close() }
+        else pending.thenAccept { mainHandler.post { channel.close() } }
+    }
+    fun reportAttemptFailure(generation: Long, attemptId: Long, reason: String) {
+        val token = activeAttempt?.takeIf { it.generation == generation && it.attemptId == attemptId } ?: return
         mainHandler.post {
-            val token = activeAttempt?.takeIf { it.attemptId == attemptId } ?: return@post
+            if (!isMiracastEnabled || !attempts.accepts(token)) return@post
             failAttempt(token, reason)
         }
     }
@@ -242,7 +353,9 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         DebugEventLog.record(DebugEventCategory.ERROR, "P2P attempt ${token.number}/3 failed: $reason")
         activeAttempt = null
         listener.onP2pAttemptFailed(token.attemptId, reason)
+        if (!isMiracastEnabled || !attempts.isCleanupPending(token)) return
         cleanupAttempt(token) { barrierOk ->
+            if (!isMiracastEnabled || !attempts.isCleanupPending(token)) return@cleanupAttempt
             if (!barrierOk) {
                 attempts.cancel(token)
                 val barrierReason = "P2P cleanup barrier timed out after failure: $reason"
@@ -277,8 +390,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         val token = attempts.beginNext() ?: return
         activeAttempt = token
         groupStarted = false
-        readinessGroup = null
-        readinessInfo = null
+        lastAutoAcceptAt = 0L
+        lastAutoAcceptAddr = null
         synchronized(groupStateLock) {
             activeGroupIdentity = null
             groupTransitionInFlight = false
@@ -286,7 +399,11 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             pendingInvitation = null
         }
         Log.i(TAG, "Starting P2P attempt ${token.number}/3 id=${token.attemptId}")
-        enterListenMode()
+        rootBridge?.let { bridge -> bridge.close(); retiredBridges += bridge }
+        rootBridge = RootBridgeClient(context)
+        p2pModeStarted = false
+        wfdSetupState = WfdSetupState.Idle
+        chainWfdInfo()
     }
     private fun cleanupAttempt(
         token: P2pAttemptController.Token,
@@ -296,8 +413,6 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         readinessRunnable?.let { mainHandler.removeCallbacks(it) }
         readinessRunnable = null
         readinessProbeInFlight = false
-        readinessGroup = null
-        readinessInfo = null
         invitationStallRunnable?.let { mainHandler.removeCallbacks(it) }
         invitationStallRunnable = null
         groupStarted = false
@@ -309,13 +424,56 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         keepAliveRunnable = null
         stopSupplicantMonitor()
         stopListeningFramework()
-        try { wpaCli("P2P_EXT_LISTEN 0 0") } catch (_: Exception) {}
+        clearExtendedListen()
         synchronized(groupStateLock) {
             activeGroupIdentity = null
             groupTransitionInFlight = false
             groupTransitionPending = false
             pendingInvitation = null
         }
+        // EOF retires the exact helper/channel which dispatched CONNECT. Its
+        // CLEANUP ACK includes cancellation/completion, WFD/mode and STA restoration.
+        // No successor may be launched merely because requestGroupInfo returns null.
+        val frameworkOwner = rootBridge
+        frameworkOwner?.let { retiredBridges += it }
+        rootBridge = null
+        val retiring = retiredBridges.toList()
+        val appOwner = synchronized(appConnectLock) { appConnect }
+        thread(name = "P2P-AttemptRestore") {
+            val appRestored = settleAppConnect(appOwner)
+            frameworkOwner?.close()
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(45)
+            var restored = true
+            retiring.forEach { bridge ->
+                val clean = try {
+                    bridge.closedAndRestored.get(
+                        (deadline - System.nanoTime()).coerceAtLeast(1),
+                        java.util.concurrent.TimeUnit.NANOSECONDS,
+                    )
+                } catch (_: Exception) { false }
+                restored = clean && restored
+            }
+            val ownersRestored = RootBridgeClient.awaitCleanup(
+                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis((deadline - System.nanoTime()).coerceAtLeast(1)),
+            )
+            mainHandler.post {
+                if (cleanupBarrierToken != token || !isMiracastEnabled) return@post
+                if (!appRestored || !restored || !ownersRestored) {
+                    DebugEventLog.record(DebugEventCategory.ERROR,
+                        "P2P owned negotiation/root restoration unconfirmed attempt=${token.attemptId}")
+                    // Group removal must still run, but can never convert an
+                    // unfinished owner restoration into successful cleanup.
+                    removeAttemptGroup(token) { onComplete(false) }
+                } else {
+                    retiredBridges.removeAll(retiring.toSet())
+                    removeAttemptGroup(token, onComplete)
+                }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun removeAttemptGroup(token: P2pAttemptController.Token, onComplete: (Boolean) -> Unit) {
         try {
             wifiP2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
@@ -334,34 +492,48 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     private fun pollCleanupBarrier(
         token: P2pAttemptController.Token,
         onComplete: (Boolean) -> Unit,
-        startedAt: Long = System.currentTimeMillis(),
+        startedAt: Long = android.os.SystemClock.elapsedRealtime(),
     ) {
         val deadline = startedAt + CLEANUP_BARRIER_TIMEOUT_MS
         cleanupBarrierRunnable?.let { mainHandler.removeCallbacks(it) }
-        cleanupBarrierRunnable = object : Runnable {
+        val poll = object : Runnable {
             override fun run() {
-                if (cleanupBarrierToken != token || cleanupBarrierRunnable == null || !isMiracastEnabled) {
+                if (cleanupBarrierToken != token || cleanupBarrierRunnable !== this || !isMiracastEnabled) {
+                    return
+                }
+                val permission = if (android.os.Build.VERSION.SDK_INT >= 33)
+                    android.Manifest.permission.NEARBY_WIFI_DEVICES else android.Manifest.permission.ACCESS_FINE_LOCATION
+                if (androidx.core.content.ContextCompat.checkSelfPermission(context, permission) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    cleanupBarrierRunnable = null
+                    cleanupBarrierToken = null
+                    DebugEventLog.record(DebugEventCategory.P2P, "Cannot inspect P2P cleanup: Wi-Fi permission denied")
+                    onComplete(false)
                     return
                 }
                 try {
                     wifiP2pManager.requestGroupInfo(channel) { group ->
-                        if (cleanupBarrierToken != token || cleanupBarrierRunnable == null || !isMiracastEnabled) {
+                        if (cleanupBarrierToken != token || cleanupBarrierRunnable !== this || !isMiracastEnabled) {
                             return@requestGroupInfo
                         }
-                        if (group == null) {
-                            cleanupBarrierRunnable = null
-                            cleanupBarrierToken = null
-                            onComplete(true)
-                        } else if (System.currentTimeMillis() >= deadline) {
+                        if (android.os.SystemClock.elapsedRealtime() >= deadline) {
                             cleanupBarrierRunnable = null
                             cleanupBarrierToken = null
                             onComplete(false)
+                        } else if (group == null) {
+                            cleanupBarrierRunnable = null
+                            cleanupBarrierToken = null
+                            onComplete(true)
                         } else {
                             mainHandler.postDelayed(this, CLEANUP_BARRIER_POLL_MS)
                         }
                     }
+                } catch (e: SecurityException) {
+                    cleanupBarrierRunnable = null
+                    cleanupBarrierToken = null
+                    DebugEventLog.record(DebugEventCategory.P2P, "P2P cleanup permission revoked: ${e.message}")
+                    onComplete(false)
                 } catch (_: Exception) {
-                    if (System.currentTimeMillis() >= deadline) {
+                    if (android.os.SystemClock.elapsedRealtime() >= deadline) {
                         cleanupBarrierRunnable = null
                         cleanupBarrierToken = null
                         onComplete(false)
@@ -371,145 +543,133 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                 }
             }
         }
-        mainHandler.post(cleanupBarrierRunnable!!)
+        cleanupBarrierRunnable = poll
+        mainHandler.post(poll)
+        mainHandler.postDelayed({
+            if (cleanupBarrierToken == token && cleanupBarrierRunnable === poll && isMiracastEnabled) {
+                cleanupBarrierRunnable = null
+                cleanupBarrierToken = null
+                onComplete(false)
+            }
+        }, CLEANUP_BARRIER_TIMEOUT_MS)
     }
 
-    /**
-     * Disconnect Wi-Fi STA to give P2P the full radio (no channel conflict).
-     * Uses WifiManager.disconnect() which is available to system apps.
-     *
-     * CRITICAL: a one-shot disconnect() is NOT enough — the framework's
-     * auto-connect immediately re-associates to the saved AP (observed:
-     * "Associated with b4:fb:e4:91:f2:b0 ... CTRL-EVENT-CONNECTED" right
-     * after we entered listen mode). The STA then sits on ch13 (2472) while
-     * P2P listens on ch1 (2412); the single radio time-shares and the
-     * Provision Discovery Response action frame is dropped (TX ack=0), so
-     * Windows never gets our reply and never sends GO-neg.
-     *
-     * Fix: disconnect, then disable every saved network AND turn off the
-     * framework's auto-connect so it cannot re-associate. We re-enable on
-     * stopSink().
-     */
-    private val disabledNetworkIds = mutableListOf<Int>()
-
-    @SuppressLint("MissingPermission")
-    private fun disconnectWifiSta() {
-        try {
-            val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            // Disable all saved networks + auto-connect so the radio stays free.
-            try {
-                @Suppress("DEPRECATION")
-                for (conf in wifiManager.configuredNetworks ?: emptyList()) {
-                    @Suppress("DEPRECATION")
-                    if (wifiManager.disableNetwork(conf.networkId)) {
-                        disabledNetworkIds.add(conf.networkId)
-                    }
-                }
-                if (disabledNetworkIds.isNotEmpty()) {
-                    Log.d(TAG, "Disabled ${disabledNetworkIds.size} saved network(s) to prevent STA reconnect")
-                }
-            } catch (e: Exception) {
-                Log.d(TAG, "disableNetwork not available: ${e.message}")
-            }
-            wifiManager.disconnect()
-            Log.d(TAG, "Disconnected Wi-Fi STA — P2P has full radio")
-        } catch (e: Exception) {
-            Log.d(TAG, "Failed to disconnect Wi-Fi: ${e.message}")
-        }
+    /** ARP is a fixed root operation belonging to the current sink session. */
+    fun readArpTable(generation: Long, attemptId: Long): String? {
+        val bridge = rootBridge ?: return null
+        val token = activeAttempt ?: return null
+        if (!isMiracastEnabled || generation != token.generation || attemptId != token.attemptId || !attempts.accepts(token)) return null
+        return bridge.readArp().takeIf { rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled }
     }
 
-    /** Re-enable networks we disabled on start (called from stopSink). */
-    @SuppressLint("MissingPermission")
-    private fun reconnectWifiSta() {
-        if (disabledNetworkIds.isEmpty()) return
-        try {
-            val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            var restoredAll = true
-            @Suppress("DEPRECATION")
-            for (id in disabledNetworkIds) {
-                @Suppress("DEPRECATION")
-                if (!wifiManager.enableNetwork(id, false)) restoredAll = false
-            }
-            @Suppress("DEPRECATION")
-            if (!wifiManager.reconnect()) restoredAll = false
-            if (restoredAll) {
-                Log.d(TAG, "Re-enabled ${disabledNetworkIds.size} saved network(s)")
-                disabledNetworkIds.clear()
-            } else {
-                Log.w(TAG, "STA restore incomplete; retaining disabled network IDs for retry")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "reconnect failed; retaining disabled network IDs: ${e.message}")
-        }
+    fun readPeerInterfaceAddress(generation: Long, attemptId: Long, interfaceName: String, peerMac: String): String? {
+        val bridge = rootBridge ?: return null
+        val token = activeAttempt ?: return null
+        if (!isMiracastEnabled || generation != token.generation || attemptId != token.attemptId || !attempts.accepts(token)) return null
+        return bridge.readPeerInterfaceAddress(interfaceName, peerMac)
+            .takeIf { rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled }
     }
 
-    private fun setMiracastModeSink() {
-        try {
-            val m = WifiP2pManager::class.java.getMethod(
-                "setMiracastMode", WifiP2pManager.Channel::class.java, Int::class.javaPrimitiveType,
-            )
-            m.invoke(wifiP2pManager, channel, 2)
-            Log.d(TAG, "setMiracastMode(2) — MIRACAST_SINK active")
+    fun launchPlayer(generation: Long, rtp: Int, rtcp: Int): Boolean {
+        val bridge = rootBridge ?: return false
+        if (!isMiracastEnabled || generation != sessionGeneration) return false
+        return try {
+            bridge.launchPlayer(generation, rtp, rtcp)
+            rootBridge === bridge && isMiracastEnabled && generation == sessionGeneration
         } catch (e: Exception) {
-            try {
-                val m2 = WifiP2pManager::class.java.getMethod("setMiracastMode", Int::class.javaPrimitiveType)
-                m2.invoke(wifiP2pManager, 2)
-                Log.d(TAG, "setMiracastMode(2) (single-arg) — MIRACAST_SINK active")
-            } catch (e2: Exception) {
-                Log.d(TAG, "setMiracastMode not available: ${e2.message}")
-            }
+            Log.e(TAG, "Privileged player launch failed", e)
+            false
         }
     }
 
     private fun chainWfdInfo() {
-        synchronized(groupStateLock) {
-            if (wfdSetupState != WfdSetupState.Idle) return
-            wfdSetupState = WfdSetupState.FrameworkPending
-        }
-        try {
-            val wfdInfoClass = Class.forName("android.net.wifi.p2p.WifiP2pWfdInfo")
-            val ctor = wfdInfoClass.getDeclaredConstructor(
-                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
-            ).apply { isAccessible = true }
-            val maxTput = try { foxlost.miracast.sink.SettingsManager.maxThroughput } catch (_: Exception) { 50 }
-            val wfdInfo = ctor.newInstance(
-                WFD_DEVICE_INFO,
-                foxlost.miracast.sink.SettingsManager.effectiveRtspPort(),
-                maxTput,
-            )
-            val method = try {
-                WifiP2pManager::class.java.getMethod(
-                    "setWfdInfo",
-                    WifiP2pManager.Channel::class.java,
-                    wfdInfoClass,
-                    WifiP2pManager.ActionListener::class.java,
+        val bridge = rootBridge ?: return
+        val token = activeAttempt ?: return
+        wfdSetupState = WfdSetupState.FrameworkPending
+        thread(name = "P2P-RootSetup") {
+            try {
+                val frameworkReady = bridge.start(
+                    token.generation,
+                    foxlost.miracast.sink.SettingsManager.effectiveRtspPort(),
+                    foxlost.miracast.sink.SettingsManager.maxThroughput,
+                    foxlost.miracast.sink.SettingsManager.disconnectWifiInSinkMode,
+                    sessionBand,
                 )
-            } catch (_: Exception) {
-                WifiP2pManager::class.java.getMethod(
-                    "setWFDInfo",
-                    WifiP2pManager.Channel::class.java,
-                    wfdInfoClass,
-                    WifiP2pManager.ActionListener::class.java,
-                )
+                mainHandler.post {
+                    if (rootBridge !== bridge || !attempts.accepts(token) || !isMiracastEnabled) return@post
+                    if (frameworkReady) {
+                        markWfdSetup(WfdSetupState.Ready)
+                        applyWfdExtendedCapabilityBit()
+                    } else {
+                        startWfdSupplicantFallback("root framework WFD rejected")
+                    }
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    if (rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled) {
+                        wfdSetupState = WfdSetupState.Failed
+                        val reason = if (e is RootCleanupException) {
+                            "Previous root cleanup blocked startup: ${e.message}"
+                        } else {
+                            "Root Wi-Fi setup unavailable: ${e.message}"
+                        }
+                        failAttempt(token, reason)
+                    }
+                }
             }
-            method.invoke(wifiP2pManager, channel, wfdInfo, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    Log.d(TAG, "setWfdInfo SUCCESS!")
-                    DebugEventLog.record(DebugEventCategory.WFD, "WFD framework capabilities ready")
-                    markWfdSetup(WfdSetupState.Ready)
-                }
+        }
+    }
 
-                override fun onFailure(reason: Int) {
-                    DebugEventLog.record(DebugEventCategory.ERROR, "WFD framework setup failed reason=$reason")
-                    Log.e(TAG, "setWfdInfo FAILED reason=$reason; trying supplicant fallback")
-                    startWfdSupplicantFallback("framework failure=$reason")
+    private fun uibcWfdEnabled(): Boolean =
+        try { foxlost.miracast.sink.SettingsManager.uibcEnabled } catch (_: Exception) { false }
+
+    private fun hexU16(value: Int): String =
+        value.coerceIn(0, 0xFFFF).toString(16).padStart(4, '0')
+
+    /**
+     * The framework WifiP2pWfdInfo API has no Extended Capability bitmap
+     * setter. The supplicant control API does: its command is
+     * WFD_SUBELEM_SET <decimal-id> <length+body-hex>.
+     */
+    private fun applyWfdExtendedCapabilityBit() {
+        val enabled = uibcWfdEnabled()
+        val command = if (enabled) "WFD_SUBELEM_SET 7 00020001" else "WFD_SUBELEM_SET 7 "
+        val bridge = rootBridge ?: return
+        thread(name = "P2P-WfdExtCapability") {
+            val ok = bridge.supplicant(command)
+            if (ok && enabled) {
+                Log.i(TAG, "WFD Extended Capability UIBC bit enabled")
+                DebugEventLog.record(DebugEventCategory.WFD, "WFD Extended Capability UIBC bit enabled")
+            } else if (ok) {
+                Log.i(TAG, "WFD Extended Capability UIBC bit cleared")
+                DebugEventLog.record(DebugEventCategory.WFD, "WFD Extended Capability UIBC bit cleared")
+            } else if (enabled) {
+                Log.w(TAG, "Unable to set WFD Extended Capability UIBC bit; RTSP UIBC remains optional")
+                DebugEventLog.record(DebugEventCategory.ERROR, "WFD Extended Capability UIBC bit unavailable")
+            } else {
+                Log.d(TAG, "WFD Extended Capability UIBC clear unavailable")
+            }
+        }
+    }
+
+    private fun fallbackWfdDeviceInfoCommand(available: Boolean = true): String {
+        val port = try { foxlost.miracast.sink.SettingsManager.effectiveRtspPort() } catch (_: Exception) { 7236 }
+        val throughput = try { foxlost.miracast.sink.SettingsManager.maxThroughput } catch (_: Exception) { 50 }
+        return "WFD_SUBELEM_SET 0 0006${if (available) "0011" else "0001"}${hexU16(port)}${hexU16(throughput)}"
+    }
+
+    private fun updateSessionAvailability(available: Boolean) {
+        val bridge = rootBridge ?: return
+        val token = activeAttempt ?: return
+        thread(name = "P2P-WfdAvailability") {
+            val ok = try {
+                bridge.availability(available) || bridge.supplicant(fallbackWfdDeviceInfoCommand(available))
+            } catch (_: Exception) { false }
+            mainHandler.post {
+                if (!ok && rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled) {
+                    failAttempt(token, "WFD session availability update rejected")
                 }
-            })
-        } catch (e: Exception) {
-            DebugEventLog.record(DebugEventCategory.ERROR, "WFD framework setup exception")
-            val err = if (e is java.lang.reflect.InvocationTargetException) e.targetException?.toString() else e.toString()
-            Log.e(TAG, "WFD framework setup failed: $err; trying supplicant fallback")
-            startWfdSupplicantFallback("framework exception")
+            }
         }
     }
 
@@ -523,9 +683,15 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         }
         Log.w(TAG, "Starting root WFD fallback: $reason")
         DebugEventLog.record(DebugEventCategory.WFD, "WFD supplicant fallback starting: $reason")
+        val bridge = rootBridge ?: return
+        val token = activeAttempt ?: return
         thread(name = "P2P-WfdFallback") {
-            val ok = wpaCli("WFD_SUBELEM_SET 00111C440032")
+            val deviceInfoApplied = bridge.supplicant(fallbackWfdDeviceInfoCommand())
+            val extendedCapabilityCommand = if (uibcWfdEnabled()) "WFD_SUBELEM_SET 7 00020001" else "WFD_SUBELEM_SET 7 "
+            val extendedCapabilityApplied = deviceInfoApplied && bridge.supplicant(extendedCapabilityCommand)
+            val ok = deviceInfoApplied && extendedCapabilityApplied
             mainHandler.post {
+                if (rootBridge !== bridge || !attempts.accepts(token) || !isMiracastEnabled) return@post
                 synchronized(groupStateLock) {
                     wfdSetupState = if (ok) WfdSetupState.Ready else WfdSetupState.Failed
                 }
@@ -533,8 +699,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                     Log.i(TAG, "Root WFD fallback applied")
                     DebugEventLog.record(DebugEventCategory.WFD, "WFD supplicant fallback applied")
                 } else {
-                    Log.w(TAG, "Root WFD fallback unavailable; continuing framework P2P setup")
-                    DebugEventLog.record(DebugEventCategory.ERROR, "WFD supplicant fallback unavailable")
+                    failAttempt(token, "Root framework and supplicant WFD setup failed")
+                    return@post
                 }
                 startP2pAfterWfdSetup()
             }
@@ -547,12 +713,15 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     }
 
     private fun startP2pAfterWfdSetup() {
-        if (!isMiracastEnabled || p2pModeStarted) return
+        if (!isMiracastEnabled || p2pModeStarted || wfdSetupState != WfdSetupState.Ready) return
         p2pModeStarted = true
         val forceGo = try { foxlost.miracast.sink.SettingsManager.forceAutonomousGo } catch (_: Exception) { false }
         if (forceGo) {
             Log.d(TAG, "forceAutonomousGo enabled — becoming Group Owner")
-            startAutonomousGo()
+            val token = activeAttempt ?: return
+            startAutonomousGo { success ->
+                if (!success && attempts.accepts(token)) failAttempt(token, "Autonomous P2P group creation rejected")
+            }
         } else {
             enterListenMode()
         }
@@ -560,13 +729,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
 
     @SuppressLint("MissingPermission")
     fun connectToPeer(device: WifiP2pDevice, goIntent: Int = GO_INTENT_CLIENT, onResult: ((Boolean) -> Unit)? = null) {
-        val config = WifiP2pConfig().apply {
-            deviceAddress = device.deviceAddress
-            groupOwnerIntent = goIntent
-            wps.setup = android.net.wifi.WpsInfo.PBC
-        }
         Log.d(TAG, "Connecting to ${device.deviceName} (${device.deviceAddress}) goIntent=$goIntent")
-        wifiP2pManager.connect(channel, config, object : WifiP2pManager.ActionListener {
+        connectTemporaryPeer(device.deviceAddress, goIntent, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { Log.d(TAG, "connect() initiated"); onResult?.invoke(true) }
             override fun onFailure(reason: Int) { Log.e(TAG, "connect() FAILED reason=$reason"); onResult?.invoke(false) }
         })
@@ -580,95 +744,6 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         })
     }
 
-    // ------------------------------------------------------------------
-    // Discoverability — continuous listen (the GO-negotiation fix)
-    //
-    // The framework's startListening() runs wpa_supplicant Extended Listen
-    // Timing at 500/500 ms. After Provision Discovery, the supplicant drops
-    // to IDLE and the next extended-listen window fires up to 500 ms later.
-    // Windows sends its GO Negotiation Request ~28 ms after PD — inside that
-    // IDLE gap — and the supplicant rejects it with Status 1 ("not ready"),
-    // deadlocking the exchange.
-    //
-    // FIX: The Xposed hook (XposedHook.hookExtListen) intercepts
-    // WifiP2pNative.p2pExtListen() and forces a 10/10 ms interval so the
-    // supplicant re-enters LISTEN within 10 ms of PD completion. Combined
-    // with Wi-Fi STA disconnect (no channel conflict), the radio is always
-    // on the P2P listen channel and the 10 ms windows are never skipped.
-    //
-    // We no longer fight extended listen from the socket layer — the Xposed
-    // hook is the single source of truth for extended-listen timing.
-    // ------------------------------------------------------------------
-
-    /**
-     * Optional vendor supplicant fallback. Framework WFD/P2P APIs are primary;
-     * these paths are used only when a real P2P interface is present and the
-     * device exposes a matching control socket.
-     */
-    private fun vendorP2pInterfaces(): List<String> {
-        val sysfsNames = try {
-            java.io.File("/sys/class/net").list()?.toList()
-        } catch (_: Exception) {
-            null
-        }
-        val procNetDev = try {
-            java.io.File("/proc/net/dev").readText()
-        } catch (_: Exception) {
-            null
-        }
-        return p2pInterfaceCandidates(sysfsNames, procNetDev)
-    }
-
-    private fun vendorP2pControlSocket(): Pair<String, String>? {
-        for (iface in vendorP2pInterfaces()) {
-            val socket = wpaSocketCandidates(iface).firstOrNull { java.io.File(it).exists() }
-            if (socket != null) return iface to socket
-        }
-        return null
-    }
-
-    private fun wpaSocketCandidates(iface: String): List<String> = listOf(
-        "/data/vendor/wifi/wpa/sockets/$iface",
-        "/data/misc/wifi/sockets/$iface",
-        "/data/vendor/wifi/wpa/sockets/wlan0",
-        "/data/misc/wifi/sockets/wlan0",
-        "/dev/socket/wpa_wlan0",
-    )
-
-    /** Run the optional vendor writer against detected interfaces. */
-    private fun wpaCli(vararg cmds: String): Boolean {
-        val ifaces = vendorP2pInterfaces()
-        if (ifaces.isEmpty()) {
-            Log.d(TAG, "wpaCli: no P2P interface; framework path remains active")
-            return false
-        }
-        val apkPath = context.packageCodePath
-        for (iface in ifaces) {
-            for (sock in wpaSocketCandidates(iface)) {
-                val dedicated = sock.endsWith("/$iface")
-                for (raw in cmds) {
-                    val cmd = if (!dedicated && !raw.startsWith("IFNAME=")) "IFNAME=$iface $raw" else raw
-                    try {
-                        val p = Runtime.getRuntime().exec(arrayOf(
-                            "su", "-c",
-                            "CLASSPATH=$apkPath app_process / foxlost.miracast.sink.p2p.SupplicantWriter $sock '$cmd' 2>&1"
-                        ))
-                        p.waitFor()
-                        val out = p.inputStream.bufferedReader().readText().trim()
-                        if (out.contains("OK") || out.contains("SENT")) {
-                            Log.d(TAG, "wpaCli[$sock] $cmd → ok")
-                            return true
-                        }
-                        Log.d(TAG, "wpaCli[$sock] → ${out.take(60)}")
-                    } catch (e: Exception) {
-                        Log.d(TAG, "wpaCli[$sock] ex: ${e.message}")
-                    }
-                }
-            }
-        }
-        Log.w(TAG, "wpaCli: no reachable control socket for ${ifaces.joinToString()}")
-        return false
-    }
 
     // ------------------------------------------------------------------
     // Supplicant event monitor — optional vendor fallback only.
@@ -676,58 +751,66 @@ class P2pManager(private val context: Context, private val listener: P2pListener
 
     private var monitorProcess: Process? = null
     private var monitorThread: Thread? = null
+    private var monitoredGeneration = -1L
+    private var monitoredAttempt = -1L
     private val goNegArmTimes = mutableMapOf<String, Long>()
 
+    @Synchronized
     private fun startSupplicantMonitor() {
         if (monitorThread?.isAlive == true) return
+        val token = activeAttempt ?: return
+        if (monitoredGeneration == token.generation && monitoredAttempt == token.attemptId) return
+        val bridge = rootBridge ?: return
+        monitoredGeneration = token.generation
+        monitoredAttempt = token.attemptId
         val runId = monitorRunId + 1L
         monitorRunId = runId
-        val apkPath = context.packageCodePath
         monitorThread = thread(name = "P2P-EventMonitor") {
-            while (isMiracastEnabled && !groupStarted && monitorRunId == runId) {
-                val control = vendorP2pControlSocket()
-                if (control == null) {
-                    Log.d(TAG, "No usable vendor supplicant socket; framework path remains active")
-                    try { Thread.sleep(2000L) } catch (_: InterruptedException) { break }
-                    continue
+            var process: Process? = null
+            try {
+                val p = bridge.monitor()
+                process = p
+                val current = synchronized(this@P2pManager) {
+                    if (isMiracastEnabled && !groupStarted && monitorRunId == runId && rootBridge === bridge) {
+                        monitorProcess = p
+                        true
+                    } else false
                 }
-                val (iface, sock) = control
-                try {
-                    val p = Runtime.getRuntime().exec(arrayOf(
-                        "su", "-c",
-                        "CLASSPATH=$apkPath app_process / foxlost.miracast.sink.p2p.SupplicantEventMonitor $sock",
-                    ))
-                    monitorProcess = p
-                    Log.i(TAG, "Supplicant event monitor attached to $iface run=$runId")
-                    p.inputStream.bufferedReader().forEachLine { line ->
-                        if (monitorRunId == runId && isMiracastEnabled && !groupStarted) {
+                if (!current) return@thread
+                Log.i(TAG, "Root supplicant monitor starting run=$runId")
+                p.inputStream.bufferedReader().forEachLine { line ->
+                    mainHandler.post {
+                        if (rootBridge === bridge && monitorRunId == runId && isMiracastEnabled && !groupStarted) {
                             handleSupplicantEvent(line)
                         }
                     }
-                    p.waitFor()
-                } catch (e: Exception) {
-                    if (monitorRunId == runId) Log.w(TAG, "monitor error: ${e.message}")
                 }
-                if (monitorRunId == runId) monitorProcess = null
-                if (!isMiracastEnabled || groupStarted || monitorRunId != runId) break
-                try { Thread.sleep(2000L) } catch (_: InterruptedException) { break }
+            } catch (e: Exception) {
+                if (monitorRunId == runId) Log.w(TAG, "Optional monitor unavailable; framework broadcasts remain active: ${e.message}")
+            } finally {
+                try { process?.outputStream?.close() } catch (_: Exception) {}
+                try { process?.waitFor() } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                process?.let { if (!it.isAlive) bridge.releaseMonitor(it) }
+                synchronized(this@P2pManager) {
+                    if (monitorRunId == runId) monitorProcess = null
+                }
             }
         }
     }
 
     private fun stopSupplicantMonitor() {
-        monitorRunId += 1L
-        val process = monitorProcess
-        val thread = monitorThread
-        monitorProcess = null
-        monitorThread = null
-        try { process?.destroy() } catch (_: Exception) {}
-        thread?.interrupt()
-        if (thread != null && thread !== Thread.currentThread()) {
-            try { thread.join(500L) } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+        val process: Process?
+        val worker: Thread?
+        synchronized(this) {
+            monitorRunId += 1L
+            process = monitorProcess
+            worker = monitorThread
+            monitorProcess = null
+            monitorThread = null
         }
+        try { process?.outputStream?.close() } catch (_: Exception) {}
+        worker?.interrupt()
+        // No join on the UI thread. The owning worker/root client reaps the helper.
     }
 
     private fun eventMac(line: String, vararg keys: String): String? {
@@ -740,8 +823,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     }
 
     private fun eventValue(line: String, key: String): String? {
-        Regex("""(?:^|\s)$key='([^']*)'""").find(line)?.groupValues?.getOrNull(1)?.let { return it }
-        return Regex("""(?:^|\s)$key=([^\s]+)""").find(line)?.groupValues?.getOrNull(1)
+        val match = Regex("""(?:^|\s)$key=(?:"([^"]*)"|'([^']*)'|([^\s]+))""").find(line) ?: return null
+        return match.groups[1]?.value ?: match.groups[2]?.value ?: match.groups[3]?.value
     }
 
     private fun eventInt(line: String, key: String): Int? =
@@ -757,7 +840,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         val groupSsid = eventValue(line, "ssid")
         val groupBssid = eventMac(line, "bssid")
         val opFrequency = eventInt(line, "op_freq") ?: eventInt(line, "freq")
-        val persistent = eventValue(line, "persistent")?.let { it == "1" || it.equals("true", true) }
+        val persistent = eventValue(line, "persistent")
         Log.i(
             TAG,
             "P2P invitation received peer=${peer ?: "unknown"} " +
@@ -796,9 +879,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                     groupSsid = eventValue(line, "ssid"),
                     groupBssid = eventMac(line, "bssid"),
                     opFrequency = eventInt(line, "op_freq") ?: eventInt(line, "freq"),
-                    persistent = eventValue(line, "persistent")?.let { value ->
-                        value == "1" || value.equals("true", true)
-                    },
+                    persistent = eventValue(line, "persistent"),
                 )
             }
             if (resolved == null || activeGroupIdentity != null) {
@@ -912,7 +993,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                 val peer = peers.deviceList.firstOrNull { device ->
                     isWfdPeerEligible(
                         status = device.status,
-                        wfdEnabled = device.wfdInfo?.isEnabled == true,
+                        wfdEnabled = device.readWfdPeerInfo().enabled,
                         preferredAddressProvided = true,
                         preferredAddressMatches = device.deviceAddress.equals(target.peerAddress, true),
                     )
@@ -926,22 +1007,13 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                     return@requestPeers
                 }
                 val goIntent = GO_INTENT_FALLBACK
-                val config = WifiP2pConfig().apply {
-                    deviceAddress = peer.deviceAddress
-                    groupOwnerIntent = goIntent
-                    wps.setup = android.net.wifi.WpsInfo.PBC
-                }
-                if (!setTemporaryNetworkId(config, "invitationFallback")) {
-                    currentAttemptToken()?.let { failAttempt(it, "invitation fallback network setup failed") }
-                    return@requestPeers
-                }
                 Log.i(
                     TAG,
                     "Invitation fallback: fresh WFD connect to ${peer.deviceName} (${peer.deviceAddress}) " +
                         "goIntent=$goIntent netId=$NETWORK_ID_TEMPORARY wps=PBC attempt=${target.attemptId}",
                 )
                 val token = currentAttemptToken()
-                wifiP2pManager.connect(channel, config, object : WifiP2pManager.ActionListener {
+                connectTemporaryPeer(peer.deviceAddress, goIntent, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         Log.i(TAG, "Invitation fallback: connect() initiated")
                         if (token != null) scheduleInvitationStall(token, target)
@@ -995,7 +1067,12 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             // Some vendor builds do not emit WIFI_P2P_CONNECTION_CHANGED_ACTION.
             // Start the same serialized group probe used by the framework path;
             // its retry policy handles the short binder-state propagation delay.
-            mainHandler.post { requestConnectionInfo("supplicant-group-started", 0) }
+            val token = currentAttemptToken() ?: return
+            mainHandler.post {
+                if (isMiracastEnabled && attempts.accepts(token)) {
+                    requestConnectionInfo("supplicant-group-started", 0)
+                }
+            }
             return
         }
         when {
@@ -1021,7 +1098,15 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                     goNegArmTimes[addr] = now
                 }
                 Log.i(TAG, "GO-NEG-REQUEST from $addr — arming supplicant (P2P_CONNECT pbc go_intent=0)")
-                thread { wpaCli("P2P_CONNECT $addr pbc go_intent=0") }
+                val bridge = rootBridge ?: return
+                val token = activeAttempt ?: return
+                thread {
+                    if (!bridge.supplicant("P2P_CONNECT $addr pbc go_intent=0")) {
+                        mainHandler.post {
+                            if (rootBridge === bridge && attempts.accepts(token)) failAttempt(token, "Root GO negotiation arm rejected")
+                        }
+                    }
+                }
             }
         }
     }
@@ -1037,12 +1122,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         stopListeningFramework()
         // The optional vendor override is independent of the framework
         // callback; explicitly disable it before handing the group to RTSP.
-        try {
-            wpaCli("P2P_EXT_LISTEN 0 0")
-        } catch (e: Exception) {
-            // Missing root/socket support is expected on non-system builds.
-            Log.d(TAG, "Unable to disable vendor Extended Listen: ${e.message}")
-        }
+        clearExtendedListen()
         listener.onDiscoveryStateChanged(false)
         Log.i(TAG, "Paused discovery, LISTEN, and Extended Listen after GROUP-STARTED")
     }
@@ -1053,21 +1133,43 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     }
 
     private fun enterListenMode() {
+        val bridge = rootBridge ?: return
+        val token = activeAttempt ?: return
+        val useListen = try { foxlost.miracast.sink.SettingsManager.usePersistentListen } catch (_: Exception) { true }
+        if (!useListen) { startDiscoveryLoop(); return }
+        thread(name = "P2P-RootListen") {
+            try {
+                bridge.listening(true)
+                mainHandler.post {
+                    if (rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled && !groupStarted) {
+                        frameworkListenActive = true
+                        enterListenModeReady(bridge, token)
+                    }
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    if (rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled) {
+                        if (e is UnsupportedOperationException) {
+                            Log.w(TAG, "Framework listen unsupported; using peer discovery")
+                            startSupplicantMonitor()
+                            startDiscoveryLoop()
+                        } else {
+                            failAttempt(token, "Root listen failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun enterListenModeReady(bridge: RootBridgeClient, token: P2pAttemptController.Token) {
         val useListen = try { foxlost.miracast.sink.SettingsManager.usePersistentListen } catch (e: Exception) { true }
         if (useListen) {
             // Framework startListening() drives proper probe responses + WFD IE
             // advertisement so Windows can FIND us. Extended-listen timing is
             // left at the framework default unless SettingsManager.extListenMs
             // is set — the supplicant event monitor arms GO-neg on demand,
-            frameworkListenFallbackStarted = false
-            if (startListeningFramework()) {
-                Log.i(TAG, "Framework LISTEN active")
-                listener.onDiscoveryStateChanged(true)
-            } else {
-                Log.w(TAG, "startListening unavailable — falling back to discoverPeers loop")
-                startDiscoveryLoop()
-                return
-            }
+            listener.onDiscoveryStateChanged(true)
             // Extended-listen override. Default OFF: the supplicant event
             // monitor (below) arms GO-neg the instant a request arrives, which
             // is the real Status-1 fix. Leave the framework's native timing
@@ -1077,8 +1179,12 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                 extListenThread = thread(name = "P2P-ExtListen-Once") {
                     try {
                         Thread.sleep(500)  // let startListening() settle first
-                        if (isMiracastEnabled && !groupStarted) {
-                            wpaCli("P2P_EXT_LISTEN $extListenMs $extListenMs")
+                        if (rootBridge === bridge && attempts.accepts(token) && isMiracastEnabled && !groupStarted) {
+                            if (!bridge.supplicant("P2P_EXT_LISTEN $extListenMs $extListenMs")) {
+                                mainHandler.post {
+                                    if (rootBridge === bridge && attempts.accepts(token)) failAttempt(token, "Extended listen override rejected")
+                                }
+                            }
                         }
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
@@ -1088,8 +1194,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                 }
                 listenRunnable = object : Runnable {
                     override fun run() {
-                        if (!isMiracastEnabled || groupStarted) return
-                        thread { wpaCli("P2P_EXT_LISTEN $extListenMs $extListenMs") }
+                        if (rootBridge !== bridge || !attempts.accepts(token) || !isMiracastEnabled || groupStarted) return
+                        thread { bridge.supplicant("P2P_EXT_LISTEN $extListenMs $extListenMs") }
                         mainHandler.postDelayed(this, 5000)
                     }
                 }
@@ -1124,89 +1230,53 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         }
     }
 
-    /**
-     * Framework-native listen-only mode. Returns true if the call was accepted.
-     */
-    private fun fallbackToDiscoveryAfterListenFailure(reason: Int) {
-        if (!isMiracastEnabled || groupStarted || frameworkListenFallbackStarted) return
-        frameworkListenFallbackStarted = true
-        Log.w(TAG, "Framework LISTEN failed asynchronously reason=$reason — falling back to discovery")
-        cancelExtendedListen()
-        keepAliveRunnable?.let { mainHandler.removeCallbacks(it) }
-        keepAliveRunnable = null
-        listenRunnable?.let { mainHandler.removeCallbacks(it) }
-        listenRunnable = null
-        stopSupplicantMonitor()
-        startDiscoveryLoop()
+    private fun clearExtendedListen() {
+        val bridge = rootBridge ?: return
+        thread(name = "P2P-ClearExtListen") { bridge.clearExtendedListen() }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun startListeningFramework(): Boolean {
-        return try {
-            val method = WifiP2pManager::class.java.getMethod(
-                "startListening",
-                WifiP2pManager.Channel::class.java,
-                WifiP2pManager.ActionListener::class.java,
-            )
-            method.invoke(wifiP2pManager, channel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    frameworkListenActive = true
-                    Log.d(TAG, "startListening onSuccess")
-                }
-                override fun onFailure(reason: Int) {
-                    frameworkListenActive = false
-                    Log.w(TAG, "startListening onFailure reason=$reason")
-                    mainHandler.post { fallbackToDiscoveryAfterListenFailure(reason) }
-                }
-            })
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "startListening reflection failed: ${e.message}")
-            false
-        }
-    }
-
-    @SuppressLint("MissingPermission")
     private fun stopListeningFramework(): Boolean {
-        return try {
-            val method = WifiP2pManager::class.java.getMethod(
-                "stopListening",
-                WifiP2pManager.Channel::class.java,
-                WifiP2pManager.ActionListener::class.java,
-            )
-            method.invoke(wifiP2pManager, channel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.d(TAG, "stopListening onSuccess") }
-                override fun onFailure(reason: Int) { Log.w(TAG, "stopListening onFailure reason=$reason") }
-            })
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "stopListening reflection failed: ${e.message}")
-            false
+        if (!frameworkListenActive) return false
+        frameworkListenActive = false
+        val bridge = rootBridge ?: return false
+        thread(name = "P2P-RootStopListen") {
+            try { bridge.listening(false) } catch (e: Exception) { Log.w(TAG, "Stop listen: ${e.message}") }
         }
+        return true
     }
 
     @SuppressLint("MissingPermission")
     private fun startDiscoveryLoop() {
         stopDiscoveryLoop()
-        if (!isMiracastEnabled) return
+        val token = currentAttemptToken() ?: return
         discoveryRunnable = object : Runnable {
+            fun current() = isMiracastEnabled && attempts.accepts(token) && discoveryRunnable === this && !groupStarted
             override fun run() {
-                if (!isMiracastEnabled) return
-                wifiP2pManager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() { listener.onDiscoveryStateChanged(true) }
-                    override fun onFailure(reason: Int) { listener.onDiscoveryStateChanged(false) }
-                })
-                mainHandler.postDelayed(this, 10000)
+                if (!current()) return
+                try {
+                    wifiP2pManager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() { if (current()) listener.onDiscoveryStateChanged(true) }
+                        override fun onFailure(reason: Int) { if (current()) listener.onDiscoveryStateChanged(false) }
+                    })
+                } catch (e: Exception) {
+                    failAttempt(token, "P2P discovery failed: ${e.message}")
+                    return
+                }
+                if (current()) mainHandler.postDelayed(this, 10000)
             }
         }
         mainHandler.post(discoveryRunnable!!)
     }
 
+    @SuppressLint("MissingPermission")
     private fun stopDiscoveryLoop() {
         discoveryRunnable?.let { mainHandler.removeCallbacks(it) }
         discoveryRunnable = null
-        @SuppressLint("MissingPermission")
-        wifiP2pManager.stopPeerDiscovery(channel, null)
+        try {
+            wifiP2pManager.stopPeerDiscovery(channel, null)
+        } catch (e: Exception) {
+            Log.w(TAG, "Stop discovery unavailable: ${e.message}")
+        }
     }
 
     private fun groupIdentity(group: WifiP2pGroup): String {
@@ -1217,28 +1287,38 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             .joinToString("|") { it ?: "" }
     }
 
-    private fun currentAttemptToken(): P2pAttemptController.Token? = activeAttempt
+    private fun currentAttemptToken(): P2pAttemptController.Token? =
+        activeAttempt?.takeIf { isMiracastEnabled && cleanupBarrierToken == null && attempts.accepts(it) }
 
-    private fun interfaceReadiness(group: WifiP2pGroup): Pair<Boolean, Boolean> {
+    private fun interfaceReadiness(group: WifiP2pGroup, info: WifiP2pInfo): Pair<Boolean, Boolean> {
         val iface = group.`interface`?.takeIf { it.isNotBlank() } ?: return false to false
-        val networkInterface = try {
-            java.net.NetworkInterface.getByName(iface)
+        return try {
+            val networkInterface = java.net.NetworkInterface.getByName(iface) ?: return false to false
+            val up = networkInterface.isUp && !networkInterface.isLoopback
+            val goAddress = info.groupOwnerAddress as? java.net.Inet4Address
+            if (goAddress == null || goAddress.isAnyLocalAddress || goAddress.isLoopbackAddress ||
+                goAddress.isMulticastAddress) return up to false
+            val addresses = networkInterface.inetAddresses
+            var ipv4Present = false
+            while (addresses.hasMoreElements()) {
+                val address = addresses.nextElement()
+                if (address is java.net.Inet4Address && !address.isLoopbackAddress && !address.isAnyLocalAddress &&
+                    (!info.isGroupOwner || address == goAddress)) {
+                    ipv4Present = true
+                    break
+                }
+            }
+            up to ipv4Present
         } catch (_: Exception) {
-            null
-        } ?: return false to false
-        val up = networkInterface.isUp && !networkInterface.isLoopback
-        val ipv4 = networkInterface.inetAddresses.toList().any {
-            it is java.net.Inet4Address && !it.isLoopbackAddress
+            // The interface can disappear between lookup and status/address reads.
+            false to false
         }
-        return up to ipv4
     }
 
     @SuppressLint("MissingPermission")
-    private fun beginGroupReadiness(group: WifiP2pGroup, info: WifiP2pInfo, token: P2pAttemptController.Token) {
-        readinessGroup = group
-        readinessInfo = info
+    private fun beginGroupReadiness(token: P2pAttemptController.Token) {
         readinessProbeInFlight = false
-        val startedAt = System.currentTimeMillis()
+        val startedAt = android.os.SystemClock.elapsedRealtime()
         readinessRunnable?.let { mainHandler.removeCallbacks(it) }
         val poll = object : Runnable {
             override fun run() {
@@ -1248,78 +1328,88 @@ class P2pManager(private val context: Context, private val listener: P2pListener
                 try {
                     wifiP2pManager.requestGroupInfo(channel) { freshGroup ->
                         if (!isMiracastEnabled || !attempts.accepts(token) || readinessRunnable !== this) {
-                            readinessProbeInFlight = false
                             return@requestGroupInfo
                         }
-                        readinessGroup = freshGroup
                         if (freshGroup == null) {
-                            readinessInfo = null
-                            readinessProbeInFlight = false
-                            evaluateGroupReadiness(token, startedAt)
+                            evaluateGroupReadiness(token, startedAt, this, null, null)
                             return@requestGroupInfo
                         }
                         try {
                             wifiP2pManager.requestConnectionInfo(channel) { freshInfo ->
-                                readinessProbeInFlight = false
-                                if (!isMiracastEnabled || !attempts.accepts(token) || readinessRunnable !== this) {
-                                    return@requestConnectionInfo
-                                }
-                                readinessInfo = freshInfo
-                                evaluateGroupReadiness(token, startedAt)
+                                evaluateGroupReadiness(token, startedAt, this, freshGroup, freshInfo)
                             }
                         } catch (_: Exception) {
-                            readinessProbeInFlight = false
-                            evaluateGroupReadiness(token, startedAt)
+                            evaluateGroupReadiness(token, startedAt, this, null, null)
                         }
                     }
                 } catch (_: Exception) {
-                    readinessProbeInFlight = false
-                    evaluateGroupReadiness(token, startedAt)
+                    evaluateGroupReadiness(token, startedAt, this, null, null)
                 }
             }
         }
         readinessRunnable = poll
         mainHandler.post(poll)
+        mainHandler.postDelayed({
+            if (isMiracastEnabled && attempts.accepts(token) && readinessRunnable === poll) {
+                failAttempt(token, "P2P group/network readiness callback deadline exceeded")
+            }
+        }, GROUP_READINESS_TIMEOUT_MS)
     }
 
     private fun evaluateGroupReadiness(
         token: P2pAttemptController.Token,
         startedAt: Long,
+        poll: Runnable,
+        currentGroup: WifiP2pGroup?,
+        currentInfo: WifiP2pInfo?,
     ) {
-        if (!isMiracastEnabled || !attempts.accepts(token)) return
-        val currentGroup = readinessGroup
-        val currentInfo = readinessInfo
-        val peerPresent = currentGroup?.owner != null || currentGroup?.clientList?.isNotEmpty() == true
-        val (interfaceUp, ipv4Present) = currentGroup?.let(::interfaceReadiness)
-            ?: (false to false)
-        when (GroupReadinessGate().evaluate(
-            elapsedMs = System.currentTimeMillis() - startedAt,
-            groupFormed = currentInfo?.groupFormed == true,
+        if (!isMiracastEnabled || !attempts.accepts(token) || readinessRunnable !== poll) return
+        readinessProbeInFlight = false
+        val matchesGroup = currentGroup != null && currentInfo != null &&
+            currentGroup.isGroupOwner == currentInfo.isGroupOwner &&
+            synchronized(groupStateLock) { activeGroupIdentity == groupIdentity(currentGroup) }
+        val peerPresent = matchesGroup && currentGroup!!.remoteWfdSource(currentInfo!!.isGroupOwner) != null
+        val (interfaceUp, ipv4Present) = if (matchesGroup) interfaceReadiness(currentGroup!!, currentInfo!!)
+            else false to false
+        when (readinessGate.evaluate(
+            elapsedMs = android.os.SystemClock.elapsedRealtime() - startedAt,
+            groupFormed = matchesGroup && currentInfo!!.groupFormed,
             peerPresent = peerPresent,
             interfaceUp = interfaceUp,
             ipv4Present = ipv4Present,
         )) {
             GroupReadinessGate.Result.Ready -> {
+                if (sessionBand != P2pBand.AUTO) {
+                    val frequency = currentGroup!!.frequency
+                    if (!sessionBand.accepts(frequency)) {
+                        readinessRunnable = null
+                        mainHandler.removeCallbacks(poll)
+                        failAttempt(token, "Requested ${sessionBand.name}, but group frequency is $frequency MHz; band enforcement not confirmed")
+                        return
+                    }
+                    DebugEventLog.record(DebugEventCategory.P2P, "Forced band verified: $frequency MHz (${sessionBand.name})")
+                }
+                DebugEventLog.record(DebugEventCategory.P2P,
+                    "P2P accepted group generation=${token.generation} attempt=${token.attemptId} " +
+                        "policy=${sessionBand.ordinal} frequencyMhz=${currentGroup!!.frequency}")
                 readinessRunnable = null
-                readinessProbeInFlight = false
+                mainHandler.removeCallbacks(poll)
                 Log.i(
                     TAG,
                     "P2P network ready attempt=${token.attemptId} " +
                         "iface=${currentGroup?.`interface` ?: "unknown"} " +
-                        "go=${currentInfo?.groupOwnerAddress?.hostAddress ?: "local"}",
+                        "go=${currentInfo?.groupOwnerAddress?.hostAddress ?: "unknown"}",
                 )
-                DebugEventLog.record(DebugEventCategory.DHCP, "P2P network ready; group interface has IPv4")
+                DebugEventLog.record(DebugEventCategory.DHCP, "P2P network ready; remote WFD source and group IPv4 verified")
                 listener.onP2pGroupConnected(currentGroup!!, currentInfo!!, token.attemptId)
             }
             GroupReadinessGate.Result.TimedOut -> {
                 readinessRunnable = null
-                readinessProbeInFlight = false
+                mainHandler.removeCallbacks(poll)
                 failAttempt(token, "P2P group/network readiness timeout")
             }
             GroupReadinessGate.Result.Waiting -> {
-                readinessRunnable?.let {
-                    mainHandler.postDelayed(it, GROUP_READINESS_POLL_MS)
-                }
+                mainHandler.postDelayed(poll, GROUP_READINESS_POLL_MS)
             }
         }
     }
@@ -1352,7 +1442,8 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             1_000L,
         )
         if (isNewGroup) {
-            beginGroupReadiness(group, info, token)
+            updateSessionAvailability(false)
+            beginGroupReadiness(token)
         } else {
             Log.d(TAG, "Ignoring duplicate P2P group transition identity=$identity")
         }
@@ -1368,8 +1459,6 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         readinessRunnable?.let { mainHandler.removeCallbacks(it) }
         readinessRunnable = null
         readinessProbeInFlight = false
-        readinessGroup = null
-        readinessInfo = null
         val hadGroupStarted = groupStarted
         groupStarted = false
         if (wasConnected || hadGroupStarted) {
@@ -1378,10 +1467,16 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         }
     }
 
-    private fun scheduleSupplicantGroupRetry(reason: String, attempt: Int) {
+    private fun scheduleSupplicantGroupRetry(
+        reason: String,
+        attempt: Int,
+        token: P2pAttemptController.Token,
+    ) {
         if (reason == "supplicant-group-started" && attempt < 3) {
             mainHandler.postDelayed({
-                requestConnectionInfo(reason, attempt + 1)
+                if (isMiracastEnabled && attempts.accepts(token)) {
+                    requestConnectionInfo(reason, attempt + 1)
+                }
             }, 300L * (attempt + 1))
         }
     }
@@ -1410,20 +1505,39 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             }
         }
         if (!startProbe) return
+        var completed = false
+        lateinit var timeout: Runnable
+        fun finish(group: WifiP2pGroup?, info: WifiP2pInfo?) {
+            if (completed || !isMiracastEnabled || !attempts.accepts(token)) return
+            completed = true
+            mainHandler.removeCallbacks(timeout)
+            completeGroupTransition(group, info, reason, attempt, token)
+        }
+        timeout = Runnable {
+            if (!completed && isMiracastEnabled && attempts.accepts(token)) {
+                completed = true
+                failAttempt(token, "P2P group probe callback deadline exceeded")
+            }
+        }
+        mainHandler.postDelayed(timeout, GROUP_READINESS_TIMEOUT_MS)
 
         try {
             wifiP2pManager.requestGroupInfo(channel) { group ->
+                if (completed || !isMiracastEnabled || !attempts.accepts(token)) return@requestGroupInfo
                 if (group == null) {
-                    completeGroupTransition(null, null, reason, attempt, token)
+                    finish(null, null)
                     return@requestGroupInfo
                 }
-                wifiP2pManager.requestConnectionInfo(channel) { info ->
-                    completeGroupTransition(group, info, reason, attempt, token)
+                try {
+                    wifiP2pManager.requestConnectionInfo(channel) { info -> finish(group, info) }
+                } catch (e: Exception) {
+                    Log.w(TAG, "P2P connection-info probe failed: ${e.message}")
+                    finish(null, null)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "P2P group probe failed: ${e.message}")
-            completeGroupTransition(null, null, reason, attempt, token)
+            finish(null, null)
         }
     }
 
@@ -1434,7 +1548,7 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         attempt: Int,
         token: P2pAttemptController.Token,
     ) {
-        if (!attempts.accepts(token)) return
+        if (!isMiracastEnabled || !attempts.accepts(token)) return
         val replayPending = synchronized(groupStateLock) {
             groupTransitionInFlight = false
             val pending = groupTransitionPending
@@ -1443,14 +1557,17 @@ class P2pManager(private val context: Context, private val listener: P2pListener
         }
         if (group != null && info?.groupFormed == true) {
             handleGroupConnected(group, info)
-        } else if (groupStarted) {
-            scheduleSupplicantGroupRetry(reason, attempt)
         } else {
-            handleGroupDisconnected()
-            scheduleSupplicantGroupRetry(reason, attempt)
+            // A start hint may precede framework state. Once the framework has
+            // actually observed a group, a missing group is a real loss even
+            // though groupStarted remains true for the duration of the session.
+            if (synchronized(groupStateLock) { activeGroupIdentity != null }) handleGroupDisconnected()
+            scheduleSupplicantGroupRetry(reason, attempt, token)
         }
         if (replayPending && isMiracastEnabled && attempts.accepts(token)) {
-            mainHandler.post { requestConnectionInfo("framework", 0) }
+            mainHandler.post {
+                if (isMiracastEnabled && attempts.accepts(token)) requestConnectionInfo("framework", 0)
+            }
         }
     }
 
@@ -1461,19 +1578,20 @@ class P2pManager(private val context: Context, private val listener: P2pListener
      */
     @SuppressLint("MissingPermission")
     fun onPeersChanged() {
-        if (!isMiracastEnabled) return
+        val token = currentAttemptToken() ?: return
         wifiP2pManager.requestPeers(channel) { peers ->
+            if (!isMiracastEnabled || !attempts.accepts(token)) return@requestPeers
             peers.deviceList.forEach { device ->
                 Log.d(
                     TAG,
                     "P2P peer ${device.deviceName} ${device.deviceAddress} " +
-                        "status=${device.status} wfd=${device.wfdInfo?.isEnabled == true}",
+                        "status=${device.status} wfd=${device.readWfdPeerInfo().enabled}",
                 )
             }
             val peer = peers.deviceList.firstOrNull { device ->
                 isWfdPeerEligible(
                     status = device.status,
-                    wfdEnabled = device.wfdInfo?.isEnabled == true,
+                    wfdEnabled = device.readWfdPeerInfo().isSource,
                     preferredAddressProvided = false,
                     preferredAddressMatches = false,
                 )
@@ -1494,31 +1612,133 @@ class P2pManager(private val context: Context, private val listener: P2pListener
     @Volatile private var lastAutoAcceptAt = 0L
     @Volatile private var lastAutoAcceptAddr: String? = null
 
-    private fun setTemporaryNetworkId(config: WifiP2pConfig, source: String = "autoAccept"): Boolean {
-        return try {
-            WifiP2pConfig::class.java.getDeclaredField("netId").apply {
-                isAccessible = true
-                setInt(config, NETWORK_ID_TEMPORARY)
+    /** Called only on cleanup workers, before closing the existing inspection helper. */
+    @SuppressLint("MissingPermission")
+    private fun settleAppConnect(owned: AppConnect?): Boolean {
+        if (owned == null) return true
+        val operation = owned.operation
+        val clean = operation.settle(
+            inspect = {
+                try {
+                    owned.inspector.inspectPeer(operation.generation, it).also { state ->
+                        Log.i(TAG, "App-channel CONNECT inspection generation=${operation.generation} state=$state")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "App-channel CONNECT inspection failed generation=${operation.generation}", e)
+                    throw e
+                }
+            },
+            cancel = {
+                val acknowledgement = java.util.concurrent.CompletableFuture<Unit>()
+                val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(6)
+                mainHandler.post {
+                    if (acknowledgement.isDone || System.nanoTime() >= deadline) {
+                        acknowledgement.completeExceptionally(
+                            java.util.concurrent.TimeoutException("App-channel cancellation dispatch deadline"))
+                        return@post
+                    }
+                    if (operation.wasRejected()) {
+                        acknowledgement.complete(Unit)
+                    } else try {
+                        // CONNECT used this exact app channel, never the helper channel.
+                        wifiP2pManager.cancelConnect(channel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() {
+                                Log.i(TAG, "App-channel CONNECT cancellation ACK generation=${operation.generation}")
+                                DebugEventLog.record(DebugEventCategory.P2P,
+                                    "App-channel CONNECT cancellation ACK generation=${operation.generation}")
+                                acknowledgement.complete(Unit)
+                            }
+                            override fun onFailure(reason: Int) {
+                                Log.w(TAG, "App-channel cancelConnect failed generation=${operation.generation} reason=$reason")
+                                acknowledgement.completeExceptionally(
+                                    IllegalStateException("App-channel cancelConnect failed reason=$reason"))
+                            }
+                        })
+                    } catch (e: Exception) { acknowledgement.completeExceptionally(e) }
+                }
+                try { acknowledgement.get(6, java.util.concurrent.TimeUnit.SECONDS) }
+                finally {
+                    if (!acknowledgement.isDone) {
+                        Log.w(TAG, "App-channel cancelConnect callback timeout generation=${operation.generation}")
+                        acknowledgement.completeExceptionally(
+                            java.util.concurrent.TimeoutException("App-channel cancelConnect callback timeout"))
+                    }
+                }
+            },
+        )
+        if (!clean) DebugEventLog.record(DebugEventCategory.ERROR,
+            "App-channel owned CONNECT cleanup unconfirmed generation=${operation.generation}")
+        return clean
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectTemporaryPeer(address: String, goIntent: Int, result: WifiP2pManager.ActionListener) {
+        val token = currentAttemptToken() ?: return
+        val bridge = rootBridge ?: return
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            try {
+                val config = WifiP2pConfig.Builder()
+                    .setDeviceAddress(android.net.MacAddress.fromString(address))
+                    .enablePersistentMode(false)
+                    .build().apply {
+                        groupOwnerIntent = goIntent
+                        wps.setup = android.net.wifi.WpsInfo.PBC
+                    }
+                val owned = synchronized(appConnectLock) {
+                    if (appConnect?.operation?.canReplace() == false) null
+                    else AppConnect(P2pConnectOperation(token.generation, address), bridge)
+                        .also { bridge.trackAppConnect(it.operation); appConnect = it }
+                }
+                if (owned == null) {
+                    result.onFailure(WifiP2pManager.BUSY)
+                    return
+                }
+                // Ownership precedes Binder dispatch, including a throwing/lost callback.
+                wifiP2pManager.connect(channel, config, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        if (isMiracastEnabled && attempts.accepts(token)) result.onSuccess()
+                    }
+                    override fun onFailure(reason: Int) {
+                        owned.operation.rejected()
+                        if (isMiracastEnabled && attempts.accepts(token)) result.onFailure(reason)
+                    }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "Temporary peer request failed", e)
+                result.onFailure(WifiP2pManager.ERROR)
             }
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "$source: cannot force temporary P2P network; refusing stale reinvoke", e)
-            false
+            return
+        }
+        thread(name = "P2P-LegacyConnect") {
+            if (rootBridge !== bridge || !isMiracastEnabled || !attempts.accepts(token)) return@thread
+            val success = try {
+                bridge.connectPeer(token.generation, address, goIntent)
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Legacy temporary peer request failed", e)
+                false
+            }
+            mainHandler.post {
+                if (rootBridge !== bridge || !attempts.accepts(token) || !isMiracastEnabled) return@post
+                if (success) result.onSuccess() else result.onFailure(WifiP2pManager.ERROR)
+            }
         }
     }
 
     @SuppressLint("MissingPermission")
     fun autoAcceptConnection(preferredAddr: String? = null) {
+        val token = currentAttemptToken() ?: return
         // Debounce: don't spam connect() while one is already in flight.
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastAutoAcceptAt < 4000 && preferredAddr != null && preferredAddr == lastAutoAcceptAddr) return
         wifiP2pManager.requestPeers(channel) { peers ->
+            if (!isMiracastEnabled || !attempts.accepts(token)) return@requestPeers
             val peer = peers.deviceList.firstOrNull { device ->
                 val preferredMatch = preferredAddr != null &&
                     device.deviceAddress.equals(preferredAddr, ignoreCase = true)
                 isWfdPeerEligible(
                     status = device.status,
-                    wfdEnabled = device.wfdInfo?.isEnabled == true,
+                    wfdEnabled = device.readWfdPeerInfo().isSource,
                     preferredAddressProvided = preferredAddr != null,
                     preferredAddressMatches = preferredMatch,
                 )
@@ -1529,18 +1749,13 @@ class P2pManager(private val context: Context, private val listener: P2pListener
             }
             lastAutoAcceptAt = now
             lastAutoAcceptAddr = peer.deviceAddress
-            val config = WifiP2pConfig().apply {
-                deviceAddress = peer.deviceAddress
-                groupOwnerIntent = try { foxlost.miracast.sink.SettingsManager.goIntentClient } catch (e: Exception) { GO_INTENT_CLIENT }
-                wps.setup = android.net.wifi.WpsInfo.PBC
-            }
-            if (!setTemporaryNetworkId(config)) return@requestPeers
+            val goIntent = try { foxlost.miracast.sink.SettingsManager.goIntentClient } catch (_: Exception) { GO_INTENT_CLIENT }
             Log.i(
                 TAG,
                 "autoAccept: connecting to ${peer.deviceName} (${peer.deviceAddress}) " +
                     "status=${peer.status} netId=$NETWORK_ID_TEMPORARY"
             )
-            wifiP2pManager.connect(channel, config, object : WifiP2pManager.ActionListener {
+            connectTemporaryPeer(peer.deviceAddress, goIntent, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() { Log.i(TAG, "autoAccept: connect() SUCCESS — supplicant armed for GO-neg") }
                 override fun onFailure(reason: Int) { Log.e(TAG, "autoAccept: connect() FAILED reason=$reason") }
             })

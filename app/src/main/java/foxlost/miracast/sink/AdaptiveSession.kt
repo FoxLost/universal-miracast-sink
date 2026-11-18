@@ -1,5 +1,9 @@
 package foxlost.miracast.sink
 
+/** WFD 6.5.2 source-startup window, measured with a monotonic clock. */
+internal fun remainingControlConnectMs(startedNanos: Long, nowNanos: Long): Long =
+    (90_000L - ((nowNanos - startedNanos).coerceAtLeast(0L) / 1_000_000L)).coerceAtLeast(0L)
+
 /** Controller lifecycle owned by one WFD session generation. */
 enum class SessionState {
     Idle,
@@ -8,7 +12,6 @@ enum class SessionState {
     GroupForming,
     GroupFormed,
     ControlConnecting,
-    ControlAccepted,
     Negotiating,
     TransportReady,
     MediaStarting,
@@ -42,7 +45,7 @@ data class PeerIdentity(
 )
 
 data class SourceEvidence(
-    val role: P2pRole,
+    val role: P2pRole? = null,
     val entry: RtspEntry,
     val firstMethod: String? = null,
     val server: String? = null,
@@ -65,14 +68,8 @@ data class CompatibilityProfile(
     val normalizeBroadcastUrl: Boolean,
 ) {
     companion object {
-        fun forRole(role: P2pRole, secondPlay: Boolean): CompatibilityProfile =
-            if (role == P2pRole.SinkClientSourceGo) {
-                windows(secondPlay, RtspEntry.Outbound)
-            } else {
-                android(secondPlay, RtspEntry.Outbound)
-            }
 
-        fun windows(secondPlay: Boolean = true, entry: RtspEntry = RtspEntry.Outbound) =
+        fun windows(secondPlay: Boolean = false, entry: RtspEntry = RtspEntry.Outbound) =
             CompatibilityProfile(
                 sourceKind = SourceKind.Windows,
                 entry = entry,
@@ -84,7 +81,7 @@ data class CompatibilityProfile(
                 normalizeBroadcastUrl = true,
             )
 
-        fun android(secondPlay: Boolean = true, entry: RtspEntry = RtspEntry.Outbound) =
+        fun android(secondPlay: Boolean = false, entry: RtspEntry = RtspEntry.Outbound) =
             CompatibilityProfile(
                 sourceKind = SourceKind.Android,
                 entry = entry,
@@ -118,25 +115,24 @@ object AdaptiveProfileSelector {
     fun entryForRole(role: P2pRole): RtspEntry = RtspEntry.Outbound
 
     fun select(evidence: SourceEvidence): CompatibilityProfile {
-        val microsoft = evidence.hasMicrosoftParameters ||
-            evidence.requestedParameters.any { it.startsWith("microsoft_", ignoreCase = true) }
-        val intel = evidence.hasIntelParameters ||
-            evidence.requestedParameters.any { it.startsWith("intel_", ignoreCase = true) }
-        val windowsShape = evidence.requestedParameters.size >= 20 ||
-            evidence.requestedParameters.any { it.equals("microsoft_video_formats", true) }
-        val androidShape =
-            evidence.firstMethod.equals("OPTIONS", true) ||
-                evidence.requestedParameters.isNotEmpty() ||
-                evidence.selectedTransport?.contains("RTP/AVP/UDP", true) == true
+        val identity = "${evidence.server.orEmpty()} ${evidence.userAgent.orEmpty()}"
         return when {
-            evidence.role == P2pRole.SinkClientSourceGo && (microsoft || intel || windowsShape) ->
-                CompatibilityProfile.windows(entry = RtspEntry.Outbound)
-            evidence.role == P2pRole.SinkGoSourceClient && androidShape ->
-                CompatibilityProfile.android(entry = RtspEntry.Outbound)
-            else -> CompatibilityProfile.unknown(entryForRole(evidence.role))
+            identity.contains("Windows", ignoreCase = true) ||
+                identity.contains("Microsoft", ignoreCase = true) ->
+                CompatibilityProfile.windows(entry = evidence.entry)
+            identity.contains("Android", ignoreCase = true) ->
+                CompatibilityProfile.android(entry = evidence.entry)
+            else -> CompatibilityProfile.unknown(evidence.entry)
         }
     }
 }
+
+data class UibcNegotiation(
+    val endpoint: foxlost.miracast.sink.uibc.UibcEndpoint? = null,
+    val capabilities: Set<foxlost.miracast.sink.uibc.UibcCapability> = emptySet(),
+    val sourceEnabled: Boolean = false,
+    val published: Boolean = false,
+)
 
 data class SessionContext(
     val generation: Long,
@@ -155,12 +151,17 @@ data class SessionContext(
     val remoteRtpPort: Int? = null,
     val remoteRtcpPort: Int? = null,
     val ssrc: Long? = null,
+    val uibc: UibcNegotiation = UibcNegotiation(),
 )
 
 
 class AdaptiveSessionController(
     private val listener: Listener = Listener.NONE,
 ) {
+    companion object {
+        // Activities/receivers outlive Service instances; generations cannot be instance-local.
+        private val nextGeneration = java.util.concurrent.atomic.AtomicLong()
+    }
     interface Listener {
         fun onStateChanged(generation: Long, state: SessionState, context: SessionContext?)
         fun onCleanup(generation: Long, reason: String)
@@ -174,7 +175,6 @@ class AdaptiveSessionController(
     }
 
     private val lock = Any()
-    private var nextGeneration = 0L
     private var currentGeneration = 0L
     private var currentState = SessionState.Idle
     private var currentContext: SessionContext? = null
@@ -192,7 +192,7 @@ class AdaptiveSessionController(
 
     fun start(): Long = synchronized(lock) {
         if (currentState != SessionState.Idle) stopLocked("replaced by new start")
-        currentGeneration = ++nextGeneration
+        currentGeneration = nextGeneration.incrementAndGet()
         currentAttemptId = 0L
         lastInvalidAttemptId = 0L
         currentState = SessionState.P2pStarting
@@ -250,6 +250,7 @@ class AdaptiveSessionController(
     fun resetAttempt(generation: Long, attemptId: Long, reason: String): Boolean = synchronized(lock) {
         if (generation != currentGeneration || currentState == SessionState.Idle ||
             currentState == SessionState.Stopping ||
+            (attemptId != 0L && attemptId <= lastInvalidAttemptId) ||
             (currentAttemptId != 0L && currentAttemptId != attemptId)
         ) return@synchronized false
         if (attemptId != 0L) lastInvalidAttemptId = maxOf(lastInvalidAttemptId, attemptId)
@@ -263,7 +264,7 @@ class AdaptiveSessionController(
 
     fun isCurrent(generation: Long, attemptId: Long): Boolean = synchronized(lock) {
         generation == currentGeneration &&
-            currentState != SessionState.Idle &&
+            currentState != SessionState.Idle && currentState != SessionState.Stopping &&
             (attemptId == 0L || (attemptId > lastInvalidAttemptId &&
                 (currentAttemptId == 0L || currentAttemptId == attemptId)))
     }
@@ -291,10 +292,36 @@ class AdaptiveSessionController(
         updated
     }
 
+    fun applyUibcEndpoint(generation: Long, endpoint: foxlost.miracast.sink.uibc.UibcEndpoint): SessionContext? = synchronized(lock) {
+        val context = currentContext ?: return@synchronized null
+        if (generation != currentGeneration || endpoint.generation != generation) return@synchronized null
+        val updated = context.copy(
+            uibc = context.uibc.copy(
+                endpoint = endpoint,
+                capabilities = endpoint.capabilities,
+                sourceEnabled = true,
+                published = true,
+            ),
+        )
+        currentContext = updated
+        listener.onStateChanged(generation, currentState, updated)
+        updated
+    }
+
+    fun disableUibc(generation: Long, reason: String): Boolean = synchronized(lock) {
+        val context = currentContext ?: return@synchronized false
+        if (generation != currentGeneration) return@synchronized false
+        currentContext = context.copy(uibc = context.uibc.copy(sourceEnabled = false, published = false))
+        DebugEventLog.record(DebugEventCategory.UIBC, "UIBC disabled generation=$generation reason=$reason")
+        listener.onStateChanged(generation, currentState, currentContext)
+        true
+    }
+
     fun beginOutbound(generation: Long, attemptId: Long = 0L): SessionContext? = synchronized(lock) {
         val context = currentContext ?: return@synchronized null
         if (generation != currentGeneration ||
             context.entry != RtspEntry.Outbound ||
+            currentState != SessionState.GroupFormed ||
             (attemptId != 0L && context.attemptId != attemptId)
         ) return@synchronized null
         currentState = SessionState.ControlConnecting
@@ -326,30 +353,20 @@ class AdaptiveSessionController(
         listener.onStateChanged(generation, currentState, currentContext)
         true
     }
-    fun acceptInbound(generation: Long, peerAddress: String): SessionContext? = synchronized(lock) {
-        val context = currentContext ?: return@synchronized null
-        if (generation != currentGeneration || context.role != P2pRole.SinkGoSourceClient) return@synchronized null
-        currentState = SessionState.ControlAccepted
-        DebugEventLog.record(DebugEventCategory.RTSP, "RTSP inbound control accepted")
-        listener.onStateChanged(generation, currentState, context)
-        currentState = SessionState.Negotiating
-        DebugEventLog.record(DebugEventCategory.RTSP, "RTSP negotiation started")
-        listener.onStateChanged(generation, currentState, context)
-        context
-    }
 
     fun markMediaStarting(generation: Long): Boolean = transition(generation, SessionState.MediaStarting)
 
     fun markStreaming(generation: Long): Boolean = transition(generation, SessionState.Streaming)
 
-    fun onGroupDisconnected(generation: Long): Boolean {
-        if (!isCurrent(generation)) return false
-        stop("P2P group disconnected")
-        return true
+    fun onGroupDisconnected(generation: Long): Boolean = synchronized(lock) {
+        if (!isCurrent(generation)) return@synchronized false
+        stopLocked("P2P group disconnected")
+        true
     }
 
     fun isCurrent(generation: Long): Boolean = synchronized(lock) {
-        generation == currentGeneration && currentState != SessionState.Idle
+        generation == currentGeneration &&
+            currentState != SessionState.Idle && currentState != SessionState.Stopping
     }
 
     fun stop(reason: String) {
@@ -357,12 +374,12 @@ class AdaptiveSessionController(
     }
 
     private fun transition(generation: Long, target: SessionState): Boolean = synchronized(lock) {
-        if (generation != currentGeneration || currentState == SessionState.Idle || currentState == SessionState.Stopping) return@synchronized false
+        if (generation != currentGeneration || !allowsTransition(currentState, target)) return@synchronized false
         currentState = target
         val category = when (target) {
             SessionState.P2pStarting, SessionState.Discovering, SessionState.GroupForming,
             SessionState.GroupFormed -> DebugEventCategory.P2P
-            SessionState.ControlConnecting, SessionState.ControlAccepted,
+            SessionState.ControlConnecting,
             SessionState.Negotiating, SessionState.TransportReady -> DebugEventCategory.RTSP
             SessionState.MediaStarting, SessionState.Streaming -> DebugEventCategory.MEDIA
             else -> DebugEventCategory.SINK
@@ -378,6 +395,13 @@ class AdaptiveSessionController(
         }
         listener.onStateChanged(generation, target, currentContext)
         true
+    }
+
+    private fun allowsTransition(from: SessionState, to: SessionState): Boolean = when (to) {
+        SessionState.GroupForming -> from == SessionState.Discovering
+        SessionState.MediaStarting -> from == SessionState.Negotiating || from == SessionState.MediaStarting
+        SessionState.Streaming -> from == SessionState.TransportReady || from == SessionState.Streaming
+        else -> false
     }
 
     private fun stopLocked(reason: String) {

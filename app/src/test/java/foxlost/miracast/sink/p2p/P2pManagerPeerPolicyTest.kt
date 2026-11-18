@@ -57,11 +57,6 @@ class P2pManagerPeerPolicyTest {
     }
 
     @Test
-    fun headlessConnectUsesTemporaryNetworkId() {
-        assertTrue(P2pManager.NETWORK_ID_TEMPORARY == -1)
-    }
-
-    @Test
     fun invitationFallbackRequiresAnAcceptedInvitation() {
         assertTrue(
             P2pManager.invitationFallbackPeer(
@@ -181,4 +176,12 @@ class P2pManagerPeerPolicyTest {
         )
     }
 
+    @Test
+    fun onlyEnabledSourceCapableDeviceTypesAreSources() {
+        for (type in 0..3) {
+            assertEquals(type == 0 || type == 3, WfdPeerInfo(true, 7236, type).isSource)
+            assertFalse(WfdPeerInfo(false, 7236, type).isSource)
+        }
+        assertFalse(WfdPeerInfo(true, 7236, null).isSource)
+    }
 }
